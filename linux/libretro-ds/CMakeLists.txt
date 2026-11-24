@@ -14,6 +14,12 @@ endif()
 foreach(feature DSPERATE_SDL DSPERATE_HEADLESS DSPERATE_TESTS DSPERATE_CHEEVOS DSPERATE_NET DSPERATE_VULKAN DSPERATE_GLES)
   set(${feature} OFF CACHE BOOL "" FORCE)
 endforeach()
+if(APPLE)
+  # macOS: DSperate's recompiler is Linux's (signal ucontext, RWX code memory without MAP_JIT): the interpreter runs
+  # DS games, and dsperate-macos.patch covers Apple clang / Mach-O.
+  set(DSPERATE_JIT OFF CACHE BOOL "" FORCE)
+  include(${ROOT}/third_party/patches/apply_dsperate_macos_patch.cmake)
+endif()
 add_subdirectory(${DS} dsperate EXCLUDE_FROM_ALL)
 # The TrimUI SDK has no lto1; this path deliberately uses no release PGO.
 set_property(TARGET dsperate_core PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
@@ -85,7 +91,10 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
   target_link_libraries(pokedaisy_ds_libretro PRIVATE stdc++fs)
 endif()
-if(NOT WIN32)
+if(APPLE)
+  # macOS (ld64): export only retro_* (the ELF version script's job on Linux).
+  target_link_options(pokedaisy_ds_libretro PRIVATE "-Wl,-exported_symbol,_retro_*")
+elseif(NOT WIN32)
   target_link_options(pokedaisy_ds_libretro PRIVATE -Wl,--version-script=${LR}/src/link.T -Wl,--no-undefined)
 endif()
 

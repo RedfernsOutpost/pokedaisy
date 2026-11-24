@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(pokedaisy_linux C)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5) # mGBA 0.10 declares an old minimum (CMake 4 refuses it)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 # Build only the pinned emulator library, never another platform frontend.

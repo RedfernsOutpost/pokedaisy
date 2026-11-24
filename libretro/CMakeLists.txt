@@ -38,7 +38,10 @@ target_include_directories(pokedaisy_gbc_libretro PRIVATE ${MGBA_INC} ${MGBA}/in
 target_link_libraries(pokedaisy_gbc_libretro PRIVATE m)
 # Only retro_* leaves the object: a second mGBA is resident beside the stock core (ADR-0006).
 # An ELF version script is Linux's: a Windows .dll exports the retro_* entry points by itself.
-if(NOT WIN32)
+if(APPLE)
+  # macOS (ld64): export only retro_* (the ELF version script's job on Linux).
+  target_link_options(pokedaisy_gbc_libretro PRIVATE "-Wl,-exported_symbol,_retro_*")
+elseif(NOT WIN32)
   target_link_options(pokedaisy_gbc_libretro PRIVATE -Wl,--exclude-libs,ALL -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/retro.map)
 endif()
 

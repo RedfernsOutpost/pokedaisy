@@ -33,11 +33,15 @@
 
 #include "library.h"
 
-/* The cores' file ending: dlopen'd .so objects on Linux, .dll on Windows. */
+/* The cores' file ending: dlopen'd .so objects on Linux, .dll on Windows, .dylib on macOS. */
 #ifdef _WIN32
 #include "SDL_syswm.h"
 #include <windows.h>
 #define PD_CORE_EXT ".dll"
+#define PD_HOST_NAME "PokeDaisy"
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#define PD_CORE_EXT ".dylib"
 #define PD_HOST_NAME "PokeDaisy"
 #else
 #define PD_CORE_EXT ".so"
@@ -1710,7 +1714,12 @@ static void settings_migrate(void) {
 static const char *core_for(const char *path) {
   const char *ext = strrchr(path, '.');
   if (ext && !strcasecmp(ext, ".gba"))
+#ifdef __APPLE__
+    // macOS: armGBA's recompiler needs RWX memory macOS refuses (no MAP_JIT path); mGBA's core runs GBA with the same companion.
+    return "pokedaisy_gbc_libretro" PD_CORE_EXT;
+#else
     return "pokedaisy_gba_libretro" PD_CORE_EXT;
+#endif
   if (ext && (!strcasecmp(ext, ".gb") || !strcasecmp(ext, ".gbc")))
     return "pokedaisy_gbc_libretro" PD_CORE_EXT;
   if (ext && !strcasecmp(ext, ".nds"))
@@ -2454,6 +2463,10 @@ static void exe_dir(const char *argv0) {
   char p[PATH_MAX];
 #ifdef _WIN32
   long n = pd_exe_path(p, sizeof p); // GetModuleFileNameA: Windows has no /proc/self/exe
+#elif defined(__APPLE__)
+  uint32_t size = sizeof p; // macOS has no /proc either
+  char raw[PATH_MAX];
+  long n = _NSGetExecutablePath(raw, &size) == 0 && realpath(raw, p) ? (long)strlen(p) : -1;
 #else
   ssize_t n = readlink("/proc/self/exe", p, sizeof p - 1);
 #endif
