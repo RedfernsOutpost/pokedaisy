@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include "pd_fs.h"
 #include "pd_env.h"
+#include "pd_zip.h"
 
 #include "library.h"
 
@@ -300,6 +301,8 @@ static void stick_dir(int stickKey, int dir, bool on) {
  * ones it has a mapping for as game controllers (its own database, DATA/gamecontrollerdb.txt, or
  * SDL_GAMECONTROLLERCONFIG, which PortMaster sets). The first one is used; an unmapped device is named in the log
  * so a mapping can be added. */
+static char padWarning[160]; // said on screen at the next frame (the list or the game)
+static char unmappedPad[64]; // the last pad without a mapping, for SETTINGS > CONTROLLER
 static void controller_added(int index) {
   if (!SDL_IsGameController(index)) {
     char guid[64];
@@ -308,6 +311,9 @@ static void controller_added(int index) {
             "Controller without a mapping: %s (%s); add one to "
             "DATA/gamecontrollerdb.txt or SDL_GAMECONTROLLERCONFIG\n",
             SDL_JoystickNameForIndex(index) ? SDL_JoystickNameForIndex(index) : "?", guid);
+    // On screen too: a pad with no mapping otherwise just looks broken.
+    snprintf(unmappedPad, sizeof unmappedPad, "%s", SDL_JoystickNameForIndex(index) ? SDL_JoystickNameForIndex(index) : "A controller");
+    snprintf(padWarning, sizeof padWarning, "%s isn't supported yet (no button map for it)", unmappedPad);
     return;
   }
   // Every pad is opened, not only the first: a stale virtual pad (one an iPhone controller app left behind) listed
@@ -324,6 +330,7 @@ static void controller_added(int index) {
   pads[padCount++] = pad;
   if (!controller)
     controller = pad;
+  unmappedPad[0] = 0;
   fprintf(stderr, "Controller: %s\n", SDL_GameControllerName(pad));
 }
 static void controller_removed(SDL_JoystickID id) {
@@ -483,6 +490,13 @@ static bool shortcut(const SDL_KeyboardEvent *k) {
 static void events(void) {
   pressed = 0;
   lastKey = 0;
+  if (padWarning[0]) { // a controller with no mapping came in (last frame): the list's notice or the game's
+    if (listShown)
+      library_say(padWarning);
+    else
+      notice(padWarning);
+    padWarning[0] = 0;
+  }
   script_rawkeys();
   SDL_Event e;
   while (SDL_PollEvent(&e)) {
@@ -774,7 +788,7 @@ static void host_load(void) {
   ds_hotkeys_follow_modifier();
   swapFace = hostSet.swapAB;
 }
-static void host_save(void) {
+static void host_write(void) {
   FILE *f = fopen(hostIni, "w");
   if (!f)
     return;
@@ -790,6 +804,109 @@ static void host_save(void) {
   for (int i = 0; i < KB_COUNT; i++)
     fprintf(f, "kb_%s=%d\n", kbIds[i], kbKeys[i]);
   fclose(f);
+}
+/* ---- a game's own settings (the game list's GAME SETTINGS, DATA/game-settings/<file>.ini): LCD FILTER, FF SPEED,
+ * REWIND and A/B BUTTONS for that game only, -1 = as for every game. While it plays they are hostSet's; a change made
+ * in its menu to one of them stays the game's, the others are everyone's. ---- */
+enum { GS_LCD, GS_FF, GS_REWIND, GS_SWAP, GS_COUNT };
+static const char *const gsIds[GS_COUNT] = {"lcd", "ff_speed", "rewind", "swap_ab"};
+static struct {
+  bool on;              // a game with its own settings is playing
+  char file[PATH_MAX * 2];
+  int own[GS_COUNT];    // the game's, -1 = everyone's
+  int every[GS_COUNT];  // everyone's, while the game's are in hostSet
+} gameSet;
+static int gs_get(int i) {
+  return i == GS_LCD ? hostSet.lcd : i == GS_FF ? hostSet.ffSpeed : i == GS_REWIND ? hostSet.rewind : hostSet.swapAB;
+}
+static void gs_set(int i, int v) {
+  if (i == GS_LCD)
+    hostSet.lcd = v != 0;
+  else if (i == GS_FF)
+    hostSet.ffSpeed = v == 0 || (v >= 2 && v <= 8) ? v : 0;
+  else if (i == GS_REWIND)
+    hostSet.rewind = v != 0;
+  else
+    hostSet.swapAB = swapFace = v != 0;
+}
+static void gs_path(const char *game, char *out, size_t size) {
+  const char *slash = strrchr(game, '/');
+  snprintf(out, size, "%s/game-settings/%s.ini", root, slash ? slash + 1 : game);
+}
+static void gs_read(const char *game, int *own) {
+  char path[PATH_MAX * 3], line[128];
+  gs_path(game, path, sizeof path);
+  for (int i = 0; i < GS_COUNT; i++)
+    own[i] = -1;
+  FILE *f = fopen(path, "r");
+  while (f && fgets(line, sizeof line, f))
+    for (int i = 0; i < GS_COUNT; i++) {
+      char key[32];
+      int v;
+      snprintf(key, sizeof key, "%s=%%d", gsIds[i]);
+      if (sscanf(line, key, &v) == 1 && v >= -1 && v <= 8)
+        own[i] = v;
+    }
+  if (f)
+    fclose(f);
+}
+static void gs_write(const char *game, const int *own) {
+  char path[PATH_MAX * 3], dir[PATH_MAX + 16];
+  gs_path(game, path, sizeof path);
+  bool any = false;
+  for (int i = 0; i < GS_COUNT; i++)
+    any |= own[i] >= 0;
+  if (!any) { // nothing of its own: no file
+    remove(path);
+    return;
+  }
+  snprintf(dir, sizeof dir, "%s/game-settings", root);
+  pd_mkdir(dir);
+  FILE *f = fopen(path, "w");
+  if (!f)
+    return;
+  for (int i = 0; i < GS_COUNT; i++)
+    if (own[i] >= 0)
+      fprintf(f, "%s=%d\n", gsIds[i], own[i]);
+  fclose(f);
+}
+static void host_save(void) {
+  if (!gameSet.on) {
+    host_write();
+    return;
+  }
+  // The game's own rows go to its file, everyone's to host.ini.
+  int now[GS_COUNT];
+  for (int i = 0; i < GS_COUNT; i++) {
+    now[i] = gs_get(i);
+    if (gameSet.own[i] >= 0)
+      gameSet.own[i] = now[i];
+    else
+      gameSet.every[i] = now[i];
+  }
+  gs_write(gameSet.file, gameSet.own);
+  for (int i = 0; i < GS_COUNT; i++)
+    gs_set(i, gameSet.every[i]);
+  host_write();
+  for (int i = 0; i < GS_COUNT; i++)
+    gs_set(i, now[i]);
+}
+static void game_settings_begin(const char *game) {
+  gs_read(game, gameSet.own);
+  snprintf(gameSet.file, sizeof gameSet.file, "%s", game);
+  for (int i = 0; i < GS_COUNT; i++) {
+    gameSet.every[i] = gs_get(i);
+    if (gameSet.own[i] >= 0)
+      gs_set(i, gameSet.own[i]);
+  }
+  gameSet.on = true;
+}
+static void game_settings_end(void) {
+  if (!gameSet.on)
+    return;
+  for (int i = 0; i < GS_COUNT; i++)
+    gs_set(i, gameSet.every[i]);
+  gameSet.on = false;
 }
 // A hotkey's button as the HOTKEYS page shows it.
 static const char *hotkey_label(int k) {
@@ -1799,6 +1916,9 @@ static void settings_migrate(void) {
   free(d);
 }
 static const char *core_for(const char *path) {
+  struct pd_zip_entry zipped;
+  if (pd_zip_is_zip(path)) // a zipped game: the core for the game inside it
+    return pd_zip_game(path, &zipped) && !pd_zip_is_zip(zipped.name) ? core_for(zipped.name) : NULL;
   const char *ext = strrchr(path, '.');
   if (ext && !strcasecmp(ext, ".gba"))
 #ifdef __APPLE__
@@ -1859,8 +1979,33 @@ static bool ds_running(void) { return running != 0; }
 // The host menu's rows, top to bottom (fast-forward is the FAST FORWARD hotkey's, held).
 enum { M_RESUME, M_SAVE, M_LOAD, M_HOTKEYS, M_KEYBOARD, M_REWIND, M_FFSPEED, M_LCD, M_SWAP, M_QUIT,
        M_COUNT };
-static void run_game(const char *path, int maxFrames, const char *shot, bool fromList) {
+/* A zipped game's copy to play: DATA/unzipped/<the game's file name>, unpacked when it isn't there yet or the zip is newer. */
+static bool unzip_game(const char *zip, char *out, size_t size) {
+  struct pd_zip_entry e;
+  if (!pd_zip_game(zip, &e))
+    return false;
+  char dir[PATH_MAX + 16];
+  snprintf(dir, sizeof dir, "%s/unzipped", root);
+  pd_mkdir(dir);
+  snprintf(out, size, "%s/%s", dir, e.name);
+  struct stat z, u;
+  if (!stat(zip, &z) && !stat(out, &u) && (uint64_t)u.st_size == e.usize && u.st_mtime >= z.st_mtime)
+    return true;
+  return pd_zip_extract(zip, &e, out);
+}
+static void run_game_play(const char *path, int maxFrames, const char *shot, bool fromList) {
   listShown = false;
+  // The save and the states are named after the file in the list (a zip's own name); the core plays its game unpacked.
+  const char *named = path;
+  char unpacked[PATH_MAX * 2];
+  if (pd_zip_is_zip(path)) {
+    if (!unzip_game(path, unpacked, sizeof unpacked)) {
+      appError = 1;
+      notice("No game in that zip could be opened");
+      return;
+    }
+    path = unpacked;
+  }
 #ifdef POCKET_DSPERATE
   const char *ext = strrchr(path, '.');
   if (ext && !strcasecmp(ext, ".nds")) {
@@ -1898,19 +2043,19 @@ static void run_game(const char *path, int maxFrames, const char *shot, bool fro
   }
   // The ROM's file name: its whole name with the extension, without the folder. A Windows path may use either slash
   // (a command line launch or a shortcut passes backslashes), and the save's name follows the ROM's.
-  const char *name = strrchr(path, '/');
+  const char *name = strrchr(named, '/');
 #ifdef _WIN32
-  const char *back = strrchr(path, '\\');
+  const char *back = strrchr(named, '\\');
   if (back && (!name || back > name))
     name = back;
 #endif
-  name = name ? name + 1 : path;
+  name = name ? name + 1 : named;
   char sav[PATH_MAX * 2], ss[PATH_MAX * 2], backups[PATH_MAX * 2];
   if (saveFile) {
     snprintf(sav, sizeof sav, "%s", saveFile);
     snprintf(backups, sizeof backups, "%s/backups", root);
   } else {
-    pd_save_path(savesDir, path, sav, sizeof sav);
+    pd_save_path(savesDir, named, sav, sizeof sav);
     snprintf(backups, sizeof backups, "%s/pokedaisy-backups", savesDir);
   }
   // DS uses L2 for the Companion and R2 for screen switching. Keep the host's DS bindings separate.
@@ -2342,6 +2487,12 @@ static void run_game(const char *path, int maxFrames, const char *shot, bool fro
   muted = false;
   held = pressed = 0;
 }
+// A game, with its own settings (GAME SETTINGS) in place while it plays.
+static void run_game(const char *path, int maxFrames, const char *shot, bool fromList) {
+  game_settings_begin(path);
+  run_game_play(path, maxFrames, shot, fromList);
+  game_settings_end();
+}
 
 // By the file name, whichever folder it is in.
 static const char *base_name(const char *p) {
@@ -2350,8 +2501,9 @@ static const char *base_name(const char *p) {
 }
 /* ---- the library (library.c): the host's own SETTINGS rows, and its canvases and covers on the screen ---- */
 static bool libraryKeyboard; // the game list's KEYBOARD row was picked: its loop opens the page
+static bool libraryHotkeys;  // its HOTKEYS row: the controller's hotkeys page
 static const char *lib_label(int row) {
-  static const char *const LABELS[] = {"LCD FILTER", "FF SPEED", "REWIND", "A/B BUTTONS", "KEYBOARD", "CONTROLLER"};
+  static const char *const LABELS[] = {"LCD FILTER", "FF SPEED", "REWIND", "A/B BUTTONS", "KEYBOARD", "HOTKEYS", "CONTROLLER"};
   return LABELS[row];
 }
 static const char *lib_group(int row) { return row == 0 ? "SCREEN" : row < 3 ? "FF / SPEED" : "CONTROLS"; }
@@ -2366,9 +2518,14 @@ static void lib_value(int row, char *out, int len) {
     snprintf(out, (size_t)len, "%s", hostSet.rewind ? "ON" : "OFF");
   else if (row == 3)
     snprintf(out, (size_t)len, "%s", hostSet.swapAB ? "SWAPPED" : "NORMAL");
-  else if (row == 5) { // the controller in use, so a pad that isn't picked up shows here, not only in the log
+  else if (row == 6) { // the controller in use, so a pad that isn't picked up shows here, not only in the log
     const char *name = controller ? SDL_GameControllerName(controller) : NULL;
-    snprintf(out, (size_t)len, "%s", name ? name : "NONE");
+    if (name)
+      snprintf(out, (size_t)len, "%s", name);
+    else if (unmappedPad[0])
+      snprintf(out, (size_t)len, "%s: NOT SUPPORTED", unmappedPad);
+    else
+      snprintf(out, (size_t)len, "NONE");
     for (char *q = out; *q; q++)
       *q = (char)toupper((unsigned char)*q);
   } else
@@ -2386,10 +2543,10 @@ static void lib_step(int row, int dir) {
     hostSet.rewind = !hostSet.rewind;
   else if (row == 3)
     hostSet.swapAB = swapFace = !hostSet.swapAB;
-  else if (row == 5)
+  else if (row == 6)
     return; // shows the controller; nothing to change
   else {
-    libraryKeyboard = true; // the loop opens the page over the list
+    *(row == 4 ? &libraryKeyboard : &libraryHotkeys) = true; // the loop opens the page over the list
     return;
   }
   host_save();
@@ -2397,7 +2554,126 @@ static void lib_step(int row, int dir) {
 #ifndef POCKET_VERSION
 #define POCKET_VERSION "dev"
 #endif
-static const struct lib_host libraryHost = {6, lib_label, lib_group, lib_value, lib_step, POCKET_VERSION};
+static const struct lib_host libraryHost = {7, lib_label, lib_group, lib_value, lib_step, POCKET_VERSION};
+
+/* The game list's HOTKEYS page: the controller buttons for FAST FORWARD, REWIND, SAVE STATE and LOAD STATE, for the
+ * Game Boy / GBA games and the DS games apart (as a game's own host menu sets them), and the MODIFIER held with them. */
+enum { HKL_DS = HK_ACTIONS, HKL_MODIFIER = 2 * HK_ACTIONS, HKL_ROWS };
+static char hkLibRows[HKL_ROWS][48];
+static const char *hkLibPtrs[HKL_ROWS];
+static struct pd_menu hkLibMenu;
+static int hkLibCapture = -1; // the row waiting for a button
+static void hk_lib_build(void) {
+  static const char *const names[HK_ACTIONS] = {"FAST FORWARD", "REWIND", "SAVE STATE", "LOAD STATE"};
+  for (int i = 0; i < HKL_ROWS; i++) {
+    const int *set = i < HKL_DS ? hostSet.hotkey : hostSet.dsHotkey;
+    const char *value = hkLibCapture == i ? "..." : i == HKL_MODIFIER ? hotkey_label(hostSet.modifier) : hotkey_label(set[i % HK_ACTIONS]);
+    snprintf(hkLibRows[i], sizeof hkLibRows[i], "%s%s  %s", i >= HKL_DS && i < HKL_MODIFIER ? "DS " : "",
+             i == HKL_MODIFIER ? "MODIFIER" : names[i % HK_ACTIONS], value);
+    hkLibPtrs[i] = hkLibRows[i];
+  }
+  hkLibMenu.title = hkLibCapture >= 0 ? "PRESS A BUTTON  (B: CANCEL)" : "HOTKEYS";
+}
+static void hk_lib_open(void) {
+  hkLibCapture = -1;
+  hk_lib_build();
+  pd_menu_init(&hkLibMenu, "HOTKEYS", hkLibPtrs, HKL_ROWS);
+  hkLibMenu.overlay = true;
+}
+/* The button pressed while a row waits: the same rules as the game's HOTKEYS page (B cancels, SELECT turns the row off,
+ * a button taken from the action that had it, never the MODIFIER's own). */
+static void hk_lib_capture(void) {
+  const int row = hkLibCapture;
+  int *set = row < HKL_DS ? hostSet.hotkey : hostSet.dsHotkey;
+  if (down(B) || down(MENU)) {
+    hkLibCapture = -1;
+    return;
+  }
+  if (down(SELECT)) {
+    if (row == HKL_MODIFIER) {
+      hostSet.modifier = hostSet.modifier == SELECT ? -1 : SELECT;
+      if (hostSet.modifier >= 0)
+        modifier_takes(hostSet.modifier);
+      ds_hotkeys_follow_modifier();
+    } else
+      set[row % HK_ACTIONS] = -1;
+    host_save();
+    hkLibCapture = -1;
+    return;
+  }
+  for (int k = 0; k < NKEYS; k++)
+    if (down(k) && (hotkey_assignable(k) || (row == HKL_MODIFIER && k == START))) {
+      if (row == HKL_MODIFIER) {
+        hostSet.modifier = k;
+        modifier_takes(k);
+        ds_hotkeys_follow_modifier();
+      } else if (k == hostSet.modifier) {
+        library_say("That button is the MODIFIER");
+        hkLibCapture = -1;
+        return;
+      } else {
+        for (int j = 0; j < HK_ACTIONS; j++)
+          if (set[j] == k)
+            set[j] = -1;
+        set[row % HK_ACTIONS] = k;
+      }
+      host_save();
+      hkLibCapture = -1;
+      return;
+    }
+}
+
+/* The game list's GAME SETTINGS page (a game's menu): that game's own LCD FILTER, FF SPEED, REWIND and A/B BUTTONS, each
+ * ALL GAMES (as SETTINGS has it) or its own. A, a click, LEFT / RIGHT step the row. */
+static char gsRows[GS_COUNT][56], gsGame[PATH_MAX * 2];
+static const char *gsPtrs[GS_COUNT];
+static int gsOwn[GS_COUNT];
+static struct pd_menu gsMenu;
+static void gs_value(int i, int v, char *out, size_t size) {
+  if (i == GS_FF && v == 0)
+    snprintf(out, size, "MAX");
+  else if (i == GS_FF)
+    snprintf(out, size, "%dx", v);
+  else if (i == GS_SWAP)
+    snprintf(out, size, "%s", v ? "SWAPPED" : "NORMAL");
+  else
+    snprintf(out, size, "%s", v ? "ON" : "OFF");
+}
+static void gs_build(void) {
+  static const char *const names[GS_COUNT] = {"LCD FILTER", "FF SPEED", "REWIND", "A/B BUTTONS"};
+  for (int i = 0; i < GS_COUNT; i++) {
+    char v[16];
+    if (gsOwn[i] >= 0)
+      gs_value(i, gsOwn[i], v, sizeof v);
+    else {
+      char every[16];
+      gs_value(i, gs_get(i), every, sizeof every);
+      snprintf(v, sizeof v, "ALL (%s)", every);
+    }
+    snprintf(gsRows[i], sizeof gsRows[i], "%s  %s", names[i], v);
+    gsPtrs[i] = gsRows[i];
+  }
+}
+static void gs_open(const char *game) {
+  snprintf(gsGame, sizeof gsGame, "%s", game);
+  gs_read(game, gsOwn);
+  gs_build();
+  pd_menu_init(&gsMenu, "GAME SETTINGS", gsPtrs, GS_COUNT);
+  gsMenu.overlay = true;
+}
+// ALL GAMES, then the row's own values in turn, round.
+static void gs_step(int i, int dir) {
+  static const int ffOrder[] = {-1, 0, 2, 3, 4, 5, 6, 7, 8}, onOff[] = {-1, 1, 0};
+  const int *order = i == GS_FF ? ffOrder : onOff;
+  const int n = i == GS_FF ? 9 : 3;
+  int at = 0;
+  for (int j = 0; j < n; j++)
+    if (order[j] == gsOwn[i])
+      at = j;
+  gsOwn[i] = order[(at + dir + n) % n];
+  gs_write(gsGame, gsOwn);
+  gs_build();
+}
 
 /* The library at a finer grain than the overlay (its 320x240 is the companion's): about 640x480 on a 1280x960 panel. Its
  * page, then the covers at the screen's own resolution, then a second canvas with the legend and the menus. */
@@ -2717,8 +2993,8 @@ int main(int argc, char **argv) {
       DIR *d = opendir(dir);
       struct dirent *e;
       while (d && (e = readdir(d)) && count < 1024) {
-        if (core_for(e->d_name)) {
-          snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        if (e->d_name[0] != '.' && core_for(path)) { // by the whole path: a zip is opened to see what's inside
           if (!firmware || pokemon_rom(path))
             paths[count++] = strdup(path);
         }
@@ -2731,6 +3007,7 @@ int main(int argc, char **argv) {
     library_open(paths, count, root, savesDir, &libraryHost);
     int ticks = 0;
     bool keyPage = false; // the KEYBOARD page over the game list
+    bool hkPage = false, gsPage = false; // HOTKEYS (SETTINGS), GAME SETTINGS (a game's menu)
     while (running && !library_quit() && !library_reload_wanted()) {
       listShown = true;
       events();
@@ -2746,7 +3023,7 @@ int main(int argc, char **argv) {
       // START + SELECT (dev's quit chord) asks to close as START or Menu do.
       if ((down(START) && (held >> SELECT & 1)) || (down(SELECT) && (held >> START & 1)))
         libDown = (libDown & ~(unsigned)LIB_SELECT) | LIB_START;
-      if (keyPage) // the KEYBOARD page has the keys
+      if (keyPage || hkPage || gsPage) // the page has the keys
         libDown = 0;
       library_keys(libDown);
       library_tick();
@@ -2758,7 +3035,50 @@ int main(int argc, char **argv) {
         pressed = held = 0; // the A that opened the page isn't the page's own
         libraryClick = false; // nor is the click that did
       }
-      if (keyPage) {
+      if (libraryHotkeys || library_game_settings()) {
+        if (libraryHotkeys)
+          hk_lib_open(), hkPage = true;
+        else
+          gs_open(library_game_settings()), gsPage = true;
+        libraryHotkeys = false;
+        library_game_settings_done();
+        pressed = held = 0;
+        libraryClick = false;
+      }
+      if (hkPage || gsPage) {
+        struct pd_menu *m = hkPage ? &hkLibMenu : &gsMenu;
+        int px = 0, py = 0, row = -1;
+        bool onPage = libraryClick && key_page_pointer(&px, &py);
+        if (onPage) { // a click on a row: as A on it
+          pd_menu_touch(m, px, py, true);
+          row = pd_menu_touch(m, px, py, false);
+        }
+        if (hkPage && hkLibCapture >= 0) {
+          hk_lib_capture();
+          if (hkLibCapture >= 0 && libraryClick && !onPage)
+            hkLibCapture = -1;
+        } else if (down(B) || down(MENU) || (libraryClick && !onPage)) {
+          hkPage = gsPage = false; // B, Escape or a click beside the page closes it
+        } else {
+          if (down(UP))
+            pd_menu_move(m, -1);
+          if (down(DOWN))
+            pd_menu_move(m, 1);
+          if (row >= 0)
+            m->selected = row;
+          if (hkPage && (down(A) || row >= 0)) {
+            hkLibCapture = m->selected;
+            pressed = held = 0; // the button that picked the row isn't its new one
+          } else if (gsPage && (down(A) || down(RIGHT) || row >= 0))
+            gs_step(m->selected, 1);
+          else if (gsPage && down(LEFT))
+            gs_step(m->selected, -1);
+        }
+        if (hkPage)
+          hk_lib_build();
+        libraryClick = libraryRightClick = false;
+        libraryWheel = 0;
+      } else if (keyPage) {
         int px = 0, py = 0;
         bool onPage = libraryClick && key_page_pointer(&px, &py);
         if (kbCapture >= 0) {
@@ -2839,7 +3159,7 @@ int main(int argc, char **argv) {
         libraryWheel = 0;
         library_played(picked);
       }
-      library_present(keyPage ? &kbMenu : NULL);
+      library_present(keyPage ? &kbMenu : hkPage ? &hkLibMenu : gsPage ? &gsMenu : NULL);
       if (frames && ++ticks >= frames) {
         if (shot && !capture(shot))
           appError = 1;

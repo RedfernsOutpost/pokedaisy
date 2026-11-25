@@ -1,5 +1,6 @@
 /* The library (library.h): the app's LibraryActivity drawn with the companion's pieces (3ds/core). */
 #include "library.h"
+#include "pd_zip.h"
 
 // Names and paths are cut to their buffers on purpose.
 #pragma GCC diagnostic ignored "-Wformat-truncation"
@@ -98,7 +99,7 @@ static bool searching;                  // the search box takes the keys
 static bool reloadWanted;               // games were added: the host lists them again
 static int *bar_scroll(int which) { return which ? &settingsScroll : &scroll; }
 static const char *picked;
-static char notice[96];
+static char notice[160];
 static unsigned noticeUntil;
 static SDL_Thread *worker;
 static SDL_atomic_t stopWorker, pauseWorker;
@@ -1279,6 +1280,9 @@ void library_open(char *const *paths, int count, const char *data, const char *s
     snprintf(g->path, sizeof g->path, "%s", paths[i]);
     snprintf(g->file, sizeof g->file, "%s", file);
     const char *ext = strrchr(file, '.');
+    struct pd_zip_entry zipped;
+    if (pd_zip_is_zip(file) && pd_zip_game(g->path, &zipped)) // a zip is the console of the game inside it
+      ext = strrchr(zipped.name, '.');
     g->console = !ext ? C_GBA : !strcasecmp(ext, ".nds") ? C_DS : !strcasecmp(ext, ".gbc") ? C_GBC : !strcasecmp(ext, ".gb") ? C_GB : C_GBA;
     g->size = file_size(g->path, &g->mtime);
     name_game(g);
@@ -1376,6 +1380,10 @@ void library_tick(void) {
 static void say(const char *text) {
   snprintf(notice, sizeof notice, "%s", text);
   noticeUntil = SDL_GetTicks() + 2500;
+}
+void library_say(const char *text) {
+  say(text);
+  noticeUntil = SDL_GetTicks() + 6000; // the host's news (a controller it can't use) stays up longer
 }
 
 static int visible_views(int *out) {
@@ -1502,7 +1510,7 @@ static void play(void) {
 /* ---- a cover of the player's choosing: FIND COVER ONLINE opens an image search for the game in the browser,
  * CHOOSE COVER takes an image file (any kind on a Mac, PNG elsewhere) as the game's box, DATA/covers/<file>.box.png. ---- */
 #define TOOLS 3     // SAVE EDITOR, TRADE SAVES, ADD GAMES
-#define MENU_ROWS 7 // PLAY, FAVORITE, FIND COVER ONLINE, CHOOSE COVER, SHOW IN FINDER, HIDE GAME, CANCEL
+#define MENU_ROWS 8 // PLAY, FAVORITE, GAME SETTINGS, FIND COVER ONLINE, CHOOSE COVER, SHOW IN FINDER, HIDE GAME, CANCEL
 #ifndef _WIN32
 static int run_wait(const char *const *argv) {
   pid_t pid;
@@ -1747,6 +1755,10 @@ static void clip_stop(void) {}
 static void clip_apply(void) {}
 #endif
 
+static char settingsFor[PATH_MAX]; // GAME SETTINGS was picked for this game: the host opens its page
+const char *library_game_settings(void) { return settingsFor[0] ? settingsFor : NULL; }
+void library_game_settings_done(void) { settingsFor[0] = 0; }
+
 static void menu_choose(void) {
   if (selected < 0 || selected >= shownCount) {
     menuOpen = false;
@@ -1761,12 +1773,14 @@ static void menu_choose(void) {
     state_save();
     relist();
   } else if (menuCursor == 2)
-    cover_search_online(g);
+    snprintf(settingsFor, sizeof settingsFor, "%s", g->path); // the host opens the game's page
   else if (menuCursor == 3)
-    cover_choose(g);
+    cover_search_online(g);
   else if (menuCursor == 4)
+    cover_choose(g);
+  else if (menuCursor == 5)
     show_in_folder(g->path);
-  else if (menuCursor == 5) {
+  else if (menuCursor == 6) {
     g->hidden = true;
     state_save();
     relist();
@@ -2533,8 +2547,8 @@ void library_draw_top(struct pd_canvas *c, uint32_t clear) {
 #else
     const char *finder = "SHOW IN FOLDER";
 #endif
-    const char *rows[MENU_ROWS] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "FIND COVER ONLINE", "CHOOSE COVER", finder,
-                                   "HIDE GAME", "CANCEL"};
+    const char *rows[MENU_ROWS] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "GAME SETTINGS", "FIND COVER ONLINE",
+                                   "CHOOSE COVER", finder, "HIDE GAME", "CANCEL"};
     int w = 240, h = 2 * 6 + 24 + MENU_ROWS * 24 + 4;
     int x = (c->w - w) / 2, y = (c->h - h) / 2;
     int f = window(c, x, y, w, h, g->title, rows, MENU_ROWS, menuCursor);
@@ -2550,9 +2564,11 @@ void library_draw_top(struct pd_canvas *c, uint32_t clear) {
       hit_add(x + f + 2, y + f + 4 + 24 + i * 24, w - 2 * f - 4, 22, LIB_HIT_CLOSE, i);
   }
   if (SDL_GetTicks() < noticeUntil) {
-    int w = pd_text_width(notice) + 24, h = 28, x = (c->w - w) / 2, y = c->h - M - h - 36;
+    int w = pd_text_width(notice) + 24, h = 28;
+    w = w > c->w - 16 ? c->w - 16 : w; // a long one (a controller's whole name) is cut to the window
+    int x = (c->w - w) / 2, y = c->h - M - h - 36;
     int f = pd_title_box(c, x, y, w, h, PD_TITLE_FILL);
-    pd_text(c, x + f + 8, pd_text_y(y, h), notice, PD_LABEL, PD_LABEL_SHADOW);
+    pd_text_fit(c, x + f + 8, pd_text_y(y, h), w - 2 * f - 16, notice, PD_LABEL, PD_LABEL_SHADOW);
   }
 }
 
@@ -2620,7 +2636,9 @@ bool library_reload_wanted(void) { return reloadWanted; }
 /* A game file dropped on the window: copied into DATA/roms (it's listed after the host lists the games again). */
 static bool add_game(const char *path) {
   const char *slash = strrchr(path, '/'), *name = slash ? slash + 1 : path, *ext = strrchr(name, '.');
-  if (!ext || (strcasecmp(ext, ".gb") && strcasecmp(ext, ".gbc") && strcasecmp(ext, ".gba") && strcasecmp(ext, ".nds")))
+  struct pd_zip_entry zipped;
+  if (!ext || (strcasecmp(ext, ".gb") && strcasecmp(ext, ".gbc") && strcasecmp(ext, ".gba") && strcasecmp(ext, ".nds") &&
+               !(pd_zip_is_zip(name) && pd_zip_game(path, &zipped))))
     return false;
   char dir[PATH_MAX + 8], dest[PATH_MAX * 2];
   snprintf(dir, sizeof dir, "%s/roms", dataDir);

@@ -62,12 +62,17 @@ void library_settings_open(void);
 void library_zoom(int dir);
 /* Games were added (dropped on the window): the host lists its folders again (library_close, then library_open). */
 bool library_reload_wanted(void);
+/* A note from the host along the bottom (a controller it can't use), for a few seconds. */
+void library_say(const char *text);
 void library_tick(void);
 void library_draw(struct pd_canvas *c);
 int library_covers(struct lib_cover *out, int max);
 void library_draw_top(struct pd_canvas *c, uint32_t clear);
 /* A menu or a question is up: the host darkens the covers too before library_draw_top. */
 bool library_dimmed(void);
+/* GAME SETTINGS was picked in a game's menu: that game's path until library_game_settings_done(), else NULL. */
+const char *library_game_settings(void);
+void library_game_settings_done(void);
 /* A game to play (then cleared), NULL = none. */
 const char *library_picked(void);
 /* The player closed the app. */
