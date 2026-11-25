@@ -34,3 +34,5 @@ its `roms/` folder and pick one from the game list. Saves, states and settings s
   also needs RWX memory), so `linux/libretro-ds` builds with `DSPERATE_JIT=OFF` on macOS, and
   `third_party/patches/dsperate-macos.patch` (applied at configure time, Apple only) covers Apple clang and Mach-O.
 - The cores end in `.dylib`, and the frontend finds its own folder with `_NSGetExecutablePath` (there is no `/proc`).
+- **Xbox controllers go through macOS's GameController framework** (`SDL_HINT_JOYSTICK_HIDAPI_XBOX` is 0 on Apple).
+  SDL's own HIDAPI Xbox driver opens a virtual Xbox controller (an iPhone controller app's) but gets none of its input.

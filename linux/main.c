@@ -2522,6 +2522,11 @@ int main(int argc, char **argv) {
   // A window manager can give another window the focus over the game (plorpOS's in-game menu on the GKD): the
   // controller has to keep reaching the host then.
   SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#ifdef __APPLE__
+  // Xbox pads through macOS's GameController framework, not SDL's own HIDAPI driver: the HIDAPI driver opens a
+  // virtual Xbox pad (an iPhone controller app's, for one) but receives none of its input. macOS reads real ones too.
+  SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "0");
+#endif
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER)) {
     fprintf(stderr, "SDL: %s\n", SDL_GetError());
     return 1;
