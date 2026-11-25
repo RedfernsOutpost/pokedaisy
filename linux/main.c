@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2263,7 +2264,7 @@ static const char *base_name(const char *p) {
 /* ---- the library (library.c): the host's own SETTINGS rows, and its canvases and covers on the screen ---- */
 static bool libraryKeyboard; // the game list's KEYBOARD row was picked: its loop opens the page
 static const char *lib_label(int row) {
-  static const char *const LABELS[] = {"LCD FILTER", "FF SPEED", "REWIND", "A/B BUTTONS", "KEYBOARD"};
+  static const char *const LABELS[] = {"LCD FILTER", "FF SPEED", "REWIND", "A/B BUTTONS", "KEYBOARD", "CONTROLLER"};
   return LABELS[row];
 }
 static const char *lib_group(int row) { return row == 0 ? "SCREEN" : row < 3 ? "FF / SPEED" : "CONTROLS"; }
@@ -2278,7 +2279,12 @@ static void lib_value(int row, char *out, int len) {
     snprintf(out, (size_t)len, "%s", hostSet.rewind ? "ON" : "OFF");
   else if (row == 3)
     snprintf(out, (size_t)len, "%s", hostSet.swapAB ? "SWAPPED" : "NORMAL");
-  else
+  else if (row == 5) { // the controller in use, so a pad that isn't picked up shows here, not only in the log
+    const char *name = controller ? SDL_GameControllerName(controller) : NULL;
+    snprintf(out, (size_t)len, "%s", name ? name : "NONE");
+    for (char *q = out; *q; q++)
+      *q = (char)toupper((unsigned char)*q);
+  } else
     snprintf(out, (size_t)len, "EDIT");
 }
 static void lib_step(int row, int dir) {
@@ -2293,6 +2299,8 @@ static void lib_step(int row, int dir) {
     hostSet.rewind = !hostSet.rewind;
   else if (row == 3)
     hostSet.swapAB = swapFace = !hostSet.swapAB;
+  else if (row == 5)
+    return; // shows the controller; nothing to change
   else {
     libraryKeyboard = true; // the loop opens the page over the list
     return;
@@ -2302,7 +2310,7 @@ static void lib_step(int row, int dir) {
 #ifndef POCKET_VERSION
 #define POCKET_VERSION "dev"
 #endif
-static const struct lib_host libraryHost = {5, lib_label, lib_group, lib_value, lib_step, POCKET_VERSION};
+static const struct lib_host libraryHost = {6, lib_label, lib_group, lib_value, lib_step, POCKET_VERSION};
 
 /* The library at a finer grain than the overlay (its 320x240 is the companion's): about 640x480 on a 1280x960 panel. Its
  * page, then the covers at the screen's own resolution, then a second canvas with the legend and the menus. */
