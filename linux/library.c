@@ -68,6 +68,7 @@ struct game {
   unsigned serial;
   char coverFile[PATH_MAX]; // DATA/covers/<file>.png: a fetched cover
   bool coverFit;            // a box (no square icon on SteamGridDB): drawn whole
+  bool hidden;              // HIDE GAME: off the list (SETTINGS > HIDDEN GAMES brings them back)
   char code[5];             // a DS cart's game code
 };
 
@@ -81,9 +82,21 @@ static int page = P_GAMES, focus = F_GAMES, view = V_ALL, sortBy = S_NAME, railC
 static bool grid = true, quit, menuOpen, closeAsk;
 static int faceColors; // BUTTON COLORS: 0 the app's (red A, yellow B, blue X, green Y), 1 green A, red B, blue X, yellow Y
 static int selected, scroll, columns = 4, menuCursor, settingsCursor, settingsScroll, toolCursor;
-static bool settingsFollow = true; // the SETTINGS list keeps the cursor in view; off while the wheel scrolls it
-static int settingsTotal, settingsView, settingsBarY, settingsBarH; // its height, the part shown, the bar's top and height
-static int barGrab = -1; // while the scroll bar is dragged: where on its thumb it was grabbed, else -1
+/* The two scrolled lists (0 the games, 1 SETTINGS): each keeps its cursor in view (follow) until the wheel or its scroll
+ * bar moves it, and a bar shows where you are. */
+static bool follow[2] = {true, true};
+struct bar {
+  int top, h, view, total, thumbH; // the track, the part shown, the list's height, the thumb's height
+};
+static struct bar bars[2];
+static int barGrab = -1, barWhich = -1; // while a bar is dragged: where on its thumb, and which
+static int zoom;                        // the covers' size: -2 (small) .. 3 (big), Cmd + / Cmd -
+static bool titleCut[1024];             // a game's name didn't fit (by games[] index): the pointer over it shows it whole
+static int hoverGame = -1, hoverX, hoverY, hoverLastX = -1, hoverLastY = -1;
+static char search[40];                 // Cmd+F: only games whose name has this
+static bool searching;                  // the search box takes the keys
+static bool reloadWanted;               // games were added: the host lists them again
+static int *bar_scroll(int which) { return which ? &settingsScroll : &scroll; }
 static const char *picked;
 static char notice[96];
 static unsigned noticeUntil;
@@ -104,6 +117,8 @@ static struct lib_hit libHits[512];
 static void clip_start(int game);
 static void clip_stop(void);
 static void clip_apply(void);
+static void open_folder(const char *dir);
+static void show_in_folder(const char *path);
 static int libHitCount;
 static void hit_add(int x, int y, int w, int h, int action, int arg) {
   if (w > 0 && h > 0 && libHitCount < (int)(sizeof libHits / sizeof *libHits))
@@ -207,8 +222,10 @@ static void state_save(void) {
   FILE *f = fopen(stateFile, "w");
   if (!f)
     return;
-  fprintf(f, "view=%d\nsort=%d\ngrid=%d\nfaces=%d\n", view, sortBy, grid, faceColors);
+  fprintf(f, "view=%d\nsort=%d\ngrid=%d\nfaces=%d\nzoom=%d\n", view, sortBy, grid, faceColors, zoom);
   for (int i = 0; i < gameCount; i++) {
+    if (games[i].hidden)
+      fprintf(f, "hidden\t%s\n", games[i].file);
     if (games[i].favSet)
       fprintf(f, "fav\t%d\t%s\n", games[i].fav, games[i].file);
     if (games[i].played)
@@ -233,6 +250,10 @@ static void state_load(void) {
       grid = v != 0;
     else if (sscanf(line, "faces=%d", &v) == 1)
       faceColors = v == 1;
+    else if (sscanf(line, "zoom=%d", &v) == 1 && v >= -2 && v <= 3)
+      zoom = v;
+    else if (sscanf(line, "hidden\t%255[^\n]", file) == 1 && by_file(file))
+      by_file(file)->hidden = true;
     else if (sscanf(line, "fav\t%d\t%255[^\n]", &v, file) == 2 && by_file(file)) {
       by_file(file)->fav = v != 0;
       by_file(file)->favSet = true;
@@ -1139,7 +1160,24 @@ static int work(void *unused) {
 
 /* ---- the views and the order ---- */
 
+/* [needle] in [hay], any case (letters and digits; "pokemon" finds Pokémon by its other letters). */
+static bool name_has(const char *hay, const char *needle) {
+  size_t n = strlen(needle);
+  for (const char *h = hay; *h; h++) {
+    size_t i = 0;
+    while (i < n && h[i] && tolower((unsigned char)h[i]) == tolower((unsigned char)needle[i]))
+      i++;
+    if (i == n)
+      return true;
+  }
+  return false;
+}
+
 static bool in_view(const struct game *g, int v) {
+  if (g->hidden)
+    return false;
+  if (search[0] && !name_has(g->title, search) && !name_has(g->file, search))
+    return false;
   switch (v) {
   case V_ALL: return true;
   case V_FAV: return g->fav;
@@ -1215,6 +1253,8 @@ static void check_saves(struct game *g) {
 }
 
 void library_open(char *const *paths, int count, const char *data, const char *saves, const struct lib_host *h) {
+  reloadWanted = searching = false;
+  hoverGame = barGrab = -1;
   library_close();
   host = h;
   snprintf(dataDir, sizeof dataDir, "%s", data);
@@ -1363,7 +1403,7 @@ static void step_view(int dir) {
 /* SETTINGS' rows: the library's three, then the host's, BUTTON COLORS (after the host's A/B BUTTONS), then VERSION. */
 enum { SET_DARK, SET_THEME, SET_ASPECT, SET_OWN };
 static int host_rows(void) { return host ? host->settings : 0; }
-static int settings_rows(void) { return SET_OWN + host_rows() + 2; }
+static int settings_rows(void) { return SET_OWN + host_rows() + 3; } // + BUTTON COLORS, HIDDEN GAMES, VERSION
 static const char *setting_group(int row) {
   if (row < SET_OWN)
     return "SCREEN";
@@ -1390,6 +1430,15 @@ static void setting_label(int row, char *label, int llen, char *value, int vlen)
   } else if (row == SET_OWN + host_rows()) {
     snprintf(label, (size_t)llen, "BUTTON COLORS");
     snprintf(value, (size_t)vlen, "%s", faceColors ? "GREEN A" : "RED A");
+  } else if (row == SET_OWN + host_rows() + 1) {
+    int hidden = 0;
+    for (int i = 0; i < gameCount; i++)
+      hidden += games[i].hidden;
+    snprintf(label, (size_t)llen, "HIDDEN GAMES");
+    if (hidden)
+      snprintf(value, (size_t)vlen, "%d: SHOW ALL", hidden);
+    else
+      snprintf(value, (size_t)vlen, "NONE");
   } else {
     snprintf(label, (size_t)llen, "VERSION");
     snprintf(value, (size_t)vlen, "%s", host && host->version ? host->version : "");
@@ -1420,7 +1469,27 @@ static void setting_step(int row, int dir) {
   else if (row == SET_OWN + host_rows()) {
     faceColors = !faceColors;
     state_save();
+  } else if (row == SET_OWN + host_rows() + 1) {
+    int shown = 0;
+    for (int i = 0; i < gameCount; i++)
+      shown += games[i].hidden, games[i].hidden = false;
+    if (shown) {
+      state_save();
+      relist();
+      say("Hidden games are back");
+    }
   }
+}
+
+static void tool_run(int i) {
+  if (i == 2) {
+    char dir[PATH_MAX + 8];
+    snprintf(dir, sizeof dir, "%s/roms", dataDir);
+    mkdir(dir, 0755);
+    open_folder(dir);
+    say("Put games in this folder, or drop them here");
+  } else
+    say("Coming to the desktop version soon");
 }
 
 static void play(void) {
@@ -1432,7 +1501,8 @@ static void play(void) {
 /* The game's B menu (PLAY / FAVORITE / CANCEL): A, or a click on its row. */
 /* ---- a cover of the player's choosing: FIND COVER ONLINE opens an image search for the game in the browser,
  * CHOOSE COVER takes an image file (any kind on a Mac, PNG elsewhere) as the game's box, DATA/covers/<file>.box.png. ---- */
-#define MENU_ROWS 5 // PLAY, FAVORITE, FIND COVER ONLINE, CHOOSE COVER, CANCEL
+#define TOOLS 3     // SAVE EDITOR, TRADE SAVES, ADD GAMES
+#define MENU_ROWS 7 // PLAY, FAVORITE, FIND COVER ONLINE, CHOOSE COVER, SHOW IN FINDER, HIDE GAME, CANCEL
 #ifndef _WIN32
 static int run_wait(const char *const *argv) {
   pid_t pid;
@@ -1442,6 +1512,31 @@ static int run_wait(const char *const *argv) {
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
     ;
   return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* The file selected in Finder (its folder in the file manager elsewhere). */
+static void show_in_folder(const char *path) {
+#ifdef __APPLE__
+  const char *argv[] = {"open", "-R", path, NULL};
+  run_wait(argv);
+#else
+  char dir[PATH_MAX];
+  snprintf(dir, sizeof dir, "%s", path);
+  char *slash = strrchr(dir, '/');
+  if (slash)
+    *slash = 0;
+  const char *argv[] = {"xdg-open", dir, NULL};
+  run_wait(argv);
+#endif
+}
+
+static void open_folder(const char *dir) {
+#ifdef __APPLE__
+  const char *argv[] = {"open", dir, NULL};
+#else
+  const char *argv[] = {"xdg-open", dir, NULL};
+#endif
+  run_wait(argv);
 }
 
 static void cover_search_online(const struct game *g) {
@@ -1644,6 +1739,8 @@ static void cover_choose(struct game *g) {
 #else
 static void cover_search_online(const struct game *g) { (void)g; }
 static void cover_choose(struct game *g) { (void)g; }
+static void show_in_folder(const char *path) { (void)path; }
+static void open_folder(const char *dir) { (void)dir; }
 static bool cover_set_from_file(struct game *g, const char *path) { (void)g; (void)path; return false; }
 static void clip_start(int game) { (void)game; }
 static void clip_stop(void) {}
@@ -1667,6 +1764,14 @@ static void menu_choose(void) {
     cover_search_online(g);
   else if (menuCursor == 3)
     cover_choose(g);
+  else if (menuCursor == 4)
+    show_in_folder(g->path);
+  else if (menuCursor == 5) {
+    g->hidden = true;
+    state_save();
+    relist();
+    say("Hidden: SETTINGS > HIDDEN GAMES brings it back");
+  }
   menuOpen = false;
 }
 
@@ -1706,7 +1811,8 @@ static void move_games(unsigned down) {
 void library_keys(unsigned down) {
   if (!down)
     return;
-  settingsFollow = true;
+  follow[0] = follow[1] = true;
+  hoverGame = -1;
   if (closeAsk) {
     if (down & (LIB_LEFT | LIB_RIGHT | LIB_UP | LIB_DOWN))
       menuCursor ^= 1;
@@ -1764,11 +1870,11 @@ void library_keys(unsigned down) {
   }
   if (page == P_TOOLS) {
     if (down & LIB_UP)
-      toolCursor = 0;
+      toolCursor = toolCursor > 0 ? toolCursor - 1 : 0;
     if (down & LIB_DOWN)
-      toolCursor = 1;
+      toolCursor = toolCursor < TOOLS - 1 ? toolCursor + 1 : TOOLS - 1;
     if (down & LIB_A)
-      say("Coming to the Linux version soon");
+      tool_run(toolCursor);
     if (down & LIB_LEFT)
       focus = F_RAIL, railCursor = P_TOOLS;
     if (down & LIB_B)
@@ -1989,6 +2095,11 @@ static void draw_rail(struct pd_canvas *c) {
 }
 
 static void draw_header(struct pd_canvas *c, int x, int w, const char *title, bool buttons) {
+  char find[64];
+  if (buttons && (searching || search[0])) { // Cmd+F: what's typed, in the title's place
+    snprintf(find, sizeof find, "SEARCH: %s%s", search, searching && (SDL_GetTicks() / 500) % 2 ? "_" : "");
+    title = find;
+  }
   int f = pd_title_box(c, x, M, w, HEADER_H, PD_TITLE_FILL);
   lib_draw_logo_24(c, x + f + 3, M + (HEADER_H - 24) / 2);
   pd_text(c, x + f + 32, pd_text_y(M, HEADER_H), title, PD_TITLE_TEXT, PD_TITLE_SHADOW);
@@ -2127,6 +2238,9 @@ static void cover_well(struct pd_canvas *c, const struct game *g, int x, int y, 
 
 static void title_line(struct pd_canvas *c, const struct game *g, int x, int y, int w) {
   int icons = (g->fav ? 13 : 0) + (g->hasSave ? 13 : 0);
+  int at = (int)(g - games);
+  if (at >= 0 && at < (int)(sizeof titleCut / sizeof *titleCut))
+    titleCut[at] = pd_text_width(g->title) > w - icons;
   pd_text_fit(c, x, y, w - icons, g->title, PD_LABEL, PD_LABEL_SHADOW);
   int ix = x + w - icons;
   if (g->fav) {
@@ -2135,6 +2249,33 @@ static void title_line(struct pd_canvas *c, const struct game *g, int x, int y, 
   }
   if (g->hasSave)
     mono(c, &SAVE_ICON, ix + 2, y + 4, 1, PD_LABEL);
+}
+
+/* A list's scroll bar on the track at (x, top, h) when [total] is taller than [view]: the thumb shows where it is, a click
+ * on the track takes it there, and the thumb can be dragged (library_hold). */
+static void draw_bar(struct pd_canvas *c, int which, int x, int top, int h, int view, int total) {
+  struct bar *b = &bars[which];
+  b->top = top, b->h = h, b->view = view, b->total = total, b->thumbH = 0;
+  int most = total - view, *sc = bar_scroll(which);
+  if (most <= 0 || h < 16)
+    return;
+  int th = h * view / total;
+  if (th < 12)
+    th = 12;
+  b->thumbH = th;
+  int ty = top + (h - th) * *sc / most;
+  pd_fill(c, x, top, 4, h, PD_DIVIDER);
+  pd_fill(c, x, ty, 4, th, PD_VALUE);
+  hit_add(x - 4, top, 12, h, LIB_HIT_SCROLLBAR, which);
+}
+
+/* Where the thumb's top at [y] puts the list. */
+static void bar_to(int which, int thumbTop) {
+  struct bar *b = &bars[which];
+  int most = b->total - b->view;
+  if (most > 0 && b->h > b->thumbH)
+    *bar_scroll(which) = (thumbTop - b->top) * most / (b->h - b->thumbH);
+  follow[which] = false;
 }
 
 static void draw_games(struct pd_canvas *c) {
@@ -2146,16 +2287,24 @@ static void draw_games(struct pd_canvas *c) {
     return;
   }
   pd_clip(c, contentX - 4, contentY, contentW + 8, contentH);
+  int total;
   if (grid) {
-    columns = (contentW + GAP) / (118 + GAP);
-    if (columns < 2)
-      columns = 2;
+    columns = (contentW + GAP) / (118 + zoom * 24 + GAP);
+    if (columns < 1)
+      columns = 1;
     int tw = (contentW - (columns - 1) * GAP) / columns, f = 3, cs = tw - 2 * (f + 3), th = 2 * f + 3 + cs + 3 + 18 + 1;
     int rowH = th + GAP, row = selected / columns;
-    if (row * rowH < scroll)
-      scroll = row * rowH;
-    if (row * rowH + th > scroll + contentH)
-      scroll = row * rowH + th - contentH;
+    total = ((shownCount + columns - 1) / columns) * rowH - GAP;
+    if (follow[0]) {
+      if (row * rowH < scroll)
+        scroll = row * rowH;
+      if (row * rowH + th > scroll + contentH)
+        scroll = row * rowH + th - contentH;
+    }
+    if (scroll > total - contentH)
+      scroll = total - contentH;
+    if (scroll < 0)
+      scroll = 0;
     for (int i = 0; i < shownCount; i++) {
       int x = contentX + (i % columns) * (tw + GAP), y = contentY + (i / columns) * rowH - scroll;
       if (y + th < contentY || y > contentY + contentH)
@@ -2172,10 +2321,17 @@ static void draw_games(struct pd_canvas *c) {
   } else {
     columns = 1;
     int rh = 46, rowH = rh + 6;
-    if (selected * rowH < scroll)
-      scroll = selected * rowH;
-    if (selected * rowH + rh > scroll + contentH)
-      scroll = selected * rowH + rh - contentH;
+    total = shownCount * rowH - 6;
+    if (follow[0]) {
+      if (selected * rowH < scroll)
+        scroll = selected * rowH;
+      if (selected * rowH + rh > scroll + contentH)
+        scroll = selected * rowH + rh - contentH;
+    }
+    if (scroll > total - contentH)
+      scroll = total - contentH;
+    if (scroll < 0)
+      scroll = 0;
     for (int i = 0; i < shownCount; i++) {
       int y = contentY + i * rowH - scroll;
       if (y + rh < contentY || y > contentY + contentH)
@@ -2201,6 +2357,7 @@ static void draw_games(struct pd_canvas *c) {
     }
   }
   pd_unclip(c);
+  draw_bar(c, 0, contentX + contentW + 2, contentY, contentH, contentH, total);
 }
 
 static void draw_settings(struct pd_canvas *c) {
@@ -2217,7 +2374,7 @@ static void draw_settings(struct pd_canvas *c) {
     lines++;
   }
   int viewH = contentH - 2 * f, total = lines * rowH, most = total > viewH ? total - viewH : 0;
-  if (settingsFollow) {
+  if (follow[1]) {
     if (cursorLine * rowH < settingsScroll)
       settingsScroll = cursorLine * rowH - rowH;
     if ((cursorLine + 1) * rowH > settingsScroll + viewH)
@@ -2227,7 +2384,6 @@ static void draw_settings(struct pd_canvas *c) {
     settingsScroll = most;
   if (settingsScroll < 0)
     settingsScroll = 0;
-  settingsTotal = total, settingsView = viewH;
   f = pd_list_box(c, contentX, contentY, contentW, contentH);
   pd_clip(c, contentX + f, contentY + f, contentW - 2 * f, contentH - 2 * f);
   int y = contentY + f - settingsScroll;
@@ -2251,24 +2407,15 @@ static void draw_settings(struct pd_canvas *c) {
     y += rowH;
   }
   pd_unclip(c);
-  // A scroll bar when the list is taller than its box: where you are, and a click on it goes there.
-  if (most > 0) {
-    int bx = contentX + contentW - f - 6, by = contentY + f + 2, bh = contentH - 2 * f - 4;
-    int th = bh * viewH / total, ty = by + (bh - th) * settingsScroll / most;
-    if (th < 12)
-      th = 12, ty = by + (bh - th) * settingsScroll / most;
-    pd_fill(c, bx, by, 4, bh, PD_DIVIDER);
-    pd_fill(c, bx, ty, 4, th, PD_VALUE);
-    settingsBarY = by, settingsBarH = bh;
-    hit_add(bx - 4, by, 12, bh, LIB_HIT_SCROLLBAR, ty - by); // arg: the thumb's top, for a grab
-  }
+  draw_bar(c, 1, contentX + contentW - f - 6, contentY + f + 2, contentH - 2 * f - 4, viewH, total);
 }
 
 static void draw_tools(struct pd_canvas *c) {
-  static const char *const NAMES[2] = {"SAVE EDITOR", "TRADE SAVES"};
-  static const char *const BLURBS[2] = {"Your party, PC boxes, money and bag.", "Trade Pokemon between two of your saves."};
-  const struct pd_art *art[2] = {&LIB_ICON_EDIT, &LIB_ICON_TRADE};
-  for (int i = 0; i < 2; i++) {
+  static const char *const NAMES[TOOLS] = {"SAVE EDITOR", "TRADE SAVES", "ADD GAMES"};
+  static const char *const BLURBS[TOOLS] = {"Your party, PC boxes, money and bag.", "Trade Pokemon between two of your saves.",
+                                            "Opens your games folder. Or drop games on this window."};
+  const struct pd_art *art[TOOLS] = {&LIB_ICON_EDIT, &LIB_ICON_TRADE, &LIB_ICON_EDIT};
+  for (int i = 0; i < TOOLS; i++) {
     int y = contentY + i * 64, h = 56;
     bool cur = focus == F_GAMES && toolCursor == i;
     int f = pd_layered_box(c, contentX, y, contentW, h, 3, pd_cur->title, pd_cur->titleCount, cur ? PD_ROW_SELECTED : PD_TITLE_FILL);
@@ -2347,6 +2494,20 @@ bool library_dimmed(void) { return menuOpen || closeAsk; }
 
 void library_draw_top(struct pd_canvas *c, uint32_t clear) {
   pd_fill(c, 0, 0, c->w, c->h, clear);
+  // The pointer over a game whose name was cut short: the whole name beside it.
+  if (!menuOpen && !closeAsk && page == P_GAMES && hoverGame >= 0 && hoverGame < gameCount &&
+      hoverGame < (int)(sizeof titleCut / sizeof *titleCut) && titleCut[hoverGame]) {
+    const char *t = games[hoverGame].title;
+    int w = pd_text_width(t) + 16, h = 24, x = hoverX + 10, y = hoverY + 16;
+    if (x + w > c->w - 2)
+      x = c->w - 2 - w;
+    if (x < 2)
+      x = 2;
+    if (y + h > c->h - 2)
+      y = hoverY - h - 6;
+    int f = pd_title_box(c, x, y, w, h, PD_TITLE_FILL);
+    pd_text(c, x + f + 5, pd_text_y(y, h), t, PD_LABEL, PD_LABEL_SHADOW);
+  }
   // The button legend, floating bottom right (the launcher's ButtonLegend).
   if (!menuOpen && !closeAsk) {
     static const char *const GAMES_LEGEND[][2] = {{"A", "OPEN"}, {"B", "OPTIONS"}, {"Y", "SETTINGS"}};
@@ -2367,7 +2528,13 @@ void library_draw_top(struct pd_canvas *c, uint32_t clear) {
   }
   if (menuOpen && selected < shownCount) {
     const struct game *g = &games[shown[selected]];
-    const char *rows[MENU_ROWS] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "FIND COVER ONLINE", "CHOOSE COVER", "CANCEL"};
+#ifdef __APPLE__
+    const char *finder = "SHOW IN FINDER";
+#else
+    const char *finder = "SHOW IN FOLDER";
+#endif
+    const char *rows[MENU_ROWS] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "FIND COVER ONLINE", "CHOOSE COVER", finder,
+                                   "HIDE GAME", "CANCEL"};
     int w = 240, h = 2 * 6 + 24 + MENU_ROWS * 24 + 4;
     int x = (c->w - w) / 2, y = (c->h - h) / 2;
     int f = window(c, x, y, w, h, g->title, rows, MENU_ROWS, menuCursor);
@@ -2400,29 +2567,89 @@ static int hit_under(int x, int y) {
 }
 
 /* A wheel notch on GAMES: one row in the grid, one game in the list. */
-static void wheel_games(int dir) {
-  if (!shownCount)
-    return;
-  int cols = grid ? columns : 1;
-  if (cols < 1)
-    cols = 1;
-  if (dir < 0) {
-    if (selected >= cols)
-      selected -= cols;
-    else
-      selected = 0;
-  } else {
-    if (selected + cols < shownCount)
-      selected += cols;
-    else
-      selected = shownCount - 1;
-  }
+bool library_searching(void) { return searching; }
+
+void library_search_open(void) {
+  searching = true;
+  page = P_GAMES;
   focus = F_GAMES;
+  menuOpen = false;
+  say("Type to search. Return: done. Esc: clear");
+}
+
+void library_search_key(int ch) {
+  size_t n = strlen(search);
+  if (ch == 27) { // Esc: no search
+    search[0] = 0;
+    searching = false;
+  } else if (ch == '\r')
+    searching = false;
+  else if (ch == '\b') {
+    if (n)
+      search[n - 1] = 0;
+  } else if (ch >= 32 && ch < 127 && n + 1 < sizeof search) {
+    search[n] = (char)ch;
+    search[n + 1] = 0;
+  } else
+    return;
+  selected = 0;
+  scroll = 0;
+  follow[0] = true;
+  relist();
+}
+
+void library_settings_open(void) {
+  page = railCursor = P_SETTINGS;
+  focus = F_GAMES;
+  menuOpen = closeAsk = false;
+}
+
+void library_zoom(int dir) {
+  int z = dir ? zoom + dir : 0;
+  if (z < -2 || z > 3)
+    return;
+  zoom = z;
+  grid = true;
+  follow[0] = true;
+  state_save();
+  say(dir > 0 ? "Bigger covers" : dir < 0 ? "Smaller covers" : "Covers back to their size");
+}
+
+bool library_reload_wanted(void) { return reloadWanted; }
+
+/* A game file dropped on the window: copied into DATA/roms (it's listed after the host lists the games again). */
+static bool add_game(const char *path) {
+  const char *slash = strrchr(path, '/'), *name = slash ? slash + 1 : path, *ext = strrchr(name, '.');
+  if (!ext || (strcasecmp(ext, ".gb") && strcasecmp(ext, ".gbc") && strcasecmp(ext, ".gba") && strcasecmp(ext, ".nds")))
+    return false;
+  char dir[PATH_MAX + 8], dest[PATH_MAX * 2];
+  snprintf(dir, sizeof dir, "%s/roms", dataDir);
+  mkdir(dir, 0755);
+  snprintf(dest, sizeof dest, "%s/%s", dir, name);
+  struct stat st;
+  if (!stat(dest, &st)) {
+    say("That game is already here");
+    return true;
+  }
+#ifndef _WIN32
+  const char *argv[] = {"cp", path, dest, NULL};
+  if (run_wait(argv)) {
+    say("That game couldn't be copied");
+    return true;
+  }
+  reloadWanted = true;
+  say("Game added");
+#endif
+  return true;
 }
 
 void library_drop(const char *what) {
 #ifndef _WIN32
-  if (selected < 0 || selected >= shownCount || !what || !*what)
+  if (!what || !*what)
+    return;
+  if (what[0] == '/' && add_game(what))
+    return;
+  if (selected < 0 || selected >= shownCount)
     return;
   struct game *g = &games[shown[selected]];
   char path[PATH_MAX];
@@ -2452,6 +2679,8 @@ void library_drop(const char *what) {
     return;
   }
   path[strcspn(path, "\r\n")] = 0;
+  if (add_game(path))
+    return;
   if (cover_set_from_file(g, path)) {
     clip_stop();
     say("Cover set");
@@ -2464,19 +2693,18 @@ void library_drop(const char *what) {
 }
 
 void library_hold(int x, int y, bool held) {
-  (void)x;
+  if (x != hoverLastX || y != hoverLastY) { // the pointer moved: the game under it, for its whole name
+    hoverLastX = x, hoverLastY = y, hoverX = x, hoverY = y;
+    int u = hit_under(x, y);
+    hoverGame = u >= 0 && libHits[u].action == LIB_HIT_GAME && libHits[u].arg < shownCount ? shown[libHits[u].arg] : -1;
+  }
   if (barGrab < 0)
     return;
-  if (!held || page != P_SETTINGS) {
+  if (!held || (barWhich == 1 && page != P_SETTINGS) || (barWhich == 0 && page != P_GAMES)) {
     barGrab = -1;
     return;
   }
-  int most = settingsTotal - settingsView, th = settingsBarH * settingsView / (settingsTotal ? settingsTotal : 1);
-  if (th < 12)
-    th = 12;
-  if (most > 0 && settingsBarH > th)
-    settingsScroll = (y - barGrab - settingsBarY) * most / (settingsBarH - th); // draw_settings keeps it in range
-  settingsFollow = false;
+  bar_to(barWhich, y - barGrab); // the drawing keeps it in range
 }
 
 void library_context(int x, int y) {
@@ -2526,15 +2754,13 @@ void library_pointer(int x, int y, bool click, int wheel) {
       return;
     if (h->action == LIB_HIT_SCROLLBAR) {
       // A press on the thumb grabs it where it was pressed; on the track, the thumb jumps there (centred) and is held.
-      int most = settingsTotal - settingsView, th = settingsBarH * settingsView / (settingsTotal ? settingsTotal : 1);
-      if (th < 12)
-        th = 12;
-      int top = settingsBarY + h->arg;
-      barGrab = y >= top && y < top + th ? y - top : th / 2;
-      if (most > 0 && settingsBarH > th)
-        settingsScroll = (y - barGrab - settingsBarY) * most / (settingsBarH - th);
-      settingsFollow = false;
-      focus = F_GAMES;
+      int w = h->arg, most = bars[w].total - bars[w].view, *sc = bar_scroll(w);
+      int top = most > 0 ? bars[w].top + (bars[w].h - bars[w].thumbH) * *sc / most : bars[w].top;
+      barWhich = w;
+      barGrab = y >= top && y < top + bars[w].thumbH ? y - top : bars[w].thumbH / 2;
+      bar_to(w, y - barGrab);
+      if (w == 1)
+        focus = F_GAMES;
       return;
     }
     if (h->action == LIB_HIT_RAIL) {
@@ -2581,7 +2807,7 @@ void library_pointer(int x, int y, bool click, int wheel) {
     } else if (h->action == LIB_HIT_TOOL) {
       toolCursor = h->arg;
       focus = F_GAMES;
-      say("Coming to the Linux version soon");
+      tool_run(toolCursor);
     }
     return;
   }
@@ -2599,30 +2825,30 @@ void library_pointer(int x, int y, bool click, int wheel) {
       for (int i = 0; i < steps; i++)
         step_view(dir);
       focus = F_GAMES;
-    } else if (h->action == LIB_HIT_GAME) {
-      for (int i = 0; i < steps; i++)
-        wheel_games(dir);
+    } else if (h->action == LIB_HIT_GAME || (h->action == LIB_HIT_SCROLLBAR && h->arg == 0)) {
+      scroll += dir * steps * 8; // the list scrolls, a little per notch (a trackpad sends many); no wrapping
+      follow[0] = false;
     } else if (h->action == LIB_HIT_SETTING || h->action == LIB_HIT_SCROLLBAR) {
-      settingsScroll += dir * steps * 8; // the list scrolls, a little per notch (a trackpad sends many); no wrapping
-      settingsFollow = false;
+      settingsScroll += dir * steps * 8;
+      follow[1] = false;
       focus = F_GAMES;
     } else if (h->action == LIB_HIT_TOOL) {
       for (int i = 0; i < steps; i++)
-        toolCursor = (toolCursor + dir + 2) % 2;
+        toolCursor = (toolCursor + dir + TOOLS) % TOOLS;
       focus = F_GAMES;
     }
     return;
   }
   if (page == P_SETTINGS) {
     settingsScroll += dir * steps * 8;
-    settingsFollow = false;
+    follow[1] = false;
     focus = F_GAMES;
   } else if (page == P_TOOLS) {
     for (int i = 0; i < steps; i++)
-      toolCursor = (toolCursor + dir + 2) % 2;
+      toolCursor = (toolCursor + dir + TOOLS) % TOOLS;
     focus = F_GAMES;
   } else {
-    for (int i = 0; i < steps; i++)
-      wheel_games(dir);
+    scroll += dir * steps * 8;
+    follow[0] = false;
   }
 }

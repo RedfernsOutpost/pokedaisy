@@ -53,6 +53,15 @@ void library_context(int x, int y);
 void library_drop(const char *what);
 /* Every frame: where the pointer is and whether the left button is down, for a scroll bar being dragged. */
 void library_hold(int x, int y, bool held);
+/* Cmd+F: the search box, and the keys it takes (a character, '\b', '\r' done, 27 clear) while library_searching(). */
+bool library_searching(void);
+void library_search_open(void);
+void library_search_key(int ch);
+/* Cmd+, : SETTINGS. Cmd+ / Cmd- / Cmd+0: bigger, smaller, usual covers. */
+void library_settings_open(void);
+void library_zoom(int dir);
+/* Games were added (dropped on the window): the host lists its folders again (library_close, then library_open). */
+bool library_reload_wanted(void);
 void library_tick(void);
 void library_draw(struct pd_canvas *c);
 int library_covers(struct lib_cover *out, int max);

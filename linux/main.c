@@ -363,6 +363,7 @@ static int mouseWindowX, mouseWindowY; // the pointer over the window, for the l
 static bool libraryClick;              // a left press this frame
 static bool libraryRightClick;         // a right press (or control-click) this frame: a game's menu
 static char libraryDropped[PATH_MAX * 2]; // a file or an image's address dropped on the window: the picked game's cover
+static bool listShown;                 // the game list is up (not a game): its shortcuts and search take keys
 static int libraryWheel;               // wheel notches this frame (+ up)
 
 static void pointer_at(int x, int y) {
@@ -434,6 +435,51 @@ static void script_rawkeys(void) {
     }
   }
 }
+/* Keys that aren't buttons: Cmd+Ctrl+F or F11 (fullscreen) anywhere; in the game list Cmd+F (search), Cmd+, (SETTINGS),
+ * Cmd + / Cmd - / Cmd+0 (cover size), and while the search box is open, the keys it types. True when taken. */
+static bool shortcut(const SDL_KeyboardEvent *k) {
+  SDL_Keycode sym = k->keysym.sym;
+  Uint16 mod = k->keysym.mod;
+  bool cmd = (mod & KMOD_GUI) != 0;
+  if (sym == SDLK_F11 || (cmd && (mod & KMOD_CTRL) && sym == SDLK_f)) {
+    if (!k->repeat) {
+      bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+      SDL_SetWindowFullscreen(window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+    }
+    return true;
+  }
+  if (!listShown)
+    return false;
+  if (cmd) {
+    if (sym == SDLK_f)
+      library_search_open();
+    else if (sym == SDLK_COMMA)
+      library_settings_open();
+    else if (sym == SDLK_EQUALS || sym == SDLK_PLUS || sym == SDLK_KP_PLUS)
+      library_zoom(1);
+    else if (sym == SDLK_MINUS || sym == SDLK_KP_MINUS)
+      library_zoom(-1);
+    else if (sym == SDLK_0)
+      library_zoom(0);
+    else
+      return false; // Cmd+Q and the rest: the system's
+    return true;
+  }
+  if (!library_searching())
+    return false;
+  if (sym == SDLK_UP || sym == SDLK_DOWN || sym == SDLK_LEFT || sym == SDLK_RIGHT)
+    return false; // still move through what's found
+  if (sym == SDLK_ESCAPE)
+    library_search_key(27);
+  else if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER)
+    library_search_key('\r');
+  else if (sym == SDLK_BACKSPACE || sym == SDLK_DELETE)
+    library_search_key('\b');
+  else if (sym >= 32 && sym < 127)
+    library_search_key((int)sym);
+  return true; // the box has the keyboard
+}
+
 static void events(void) {
   pressed = 0;
   lastKey = 0;
@@ -450,6 +496,8 @@ static void events(void) {
       controller_added(e.cdevice.which);
     if (e.type == SDL_CONTROLLERDEVICEREMOVED)
       controller_removed(e.cdevice.which);
+    if (e.type == SDL_KEYDOWN && shortcut(&e.key))
+      continue; // Cmd shortcuts, fullscreen, the game list's search: not a button
     if (e.type == SDL_KEYDOWN && kbCapture >= 0)
       lastKey = (int)e.key.keysym.sym; // the KEYBOARD page's next key: the game sees nothing of it
     else if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) && !e.key.repeat)
@@ -648,7 +696,8 @@ static struct {
   int modifier;
   bool fullscreen; // the WINDOW setting
   int panel;       // the PANEL setting: 0 = the window's size, else a preset the core lays out for
-} hostSet = {0, false, false, false, {R2, L2, -1, -1}, {R2, L2, -1, -1}, SELECT, false, 0};
+  int winX, winY, winW, winH; // where the window was at the last quit (winW 0: never saved)
+} hostSet = {0, false, false, false, {R2, L2, -1, -1}, {R2, L2, -1, -1}, SELECT, false, 0, 0, 0, 0, 0};
 static char hostIni[PATH_MAX];
 /* A DS game's L2 / R2 are its companion and screen buttons: with no modifier held for them, its FAST FORWARD and REWIND
  * go back to the stick clicks (R3 / L3), and come back to R2 / L2 when a modifier is picked again. */
@@ -689,6 +738,9 @@ static void host_load(void) {
       hostSet.fullscreen = v != 0;
     if (sscanf(line, "panel=%d", &v) == 1 && v >= 0 && v < PD_PANEL_PRESETS)
       hostSet.panel = v;
+    int wx, wy, ww, wh;
+    if (sscanf(line, "window=%d,%d,%d,%d", &wx, &wy, &ww, &wh) == 4 && ww >= 160 && wh >= 144 && ww <= 16384 && wh <= 16384)
+      hostSet.winX = wx, hostSet.winY = wy, hostSet.winW = ww, hostSet.winH = wh;
     char modifier[16];
     if (sscanf(line, "hk_modifier=%15s", modifier) == 1) {
       int k = key_named(modifier);
@@ -728,6 +780,8 @@ static void host_save(void) {
     return;
   fprintf(f, "ff_speed=%d\nrewind=%d\nlcd=%d\nswap_ab=%d\n", hostSet.ffSpeed, hostSet.rewind, hostSet.lcd, hostSet.swapAB);
   fprintf(f, "fullscreen=%d\npanel=%d\n", hostSet.fullscreen, hostSet.panel);
+  if (hostSet.winW)
+    fprintf(f, "window=%d,%d,%d,%d\n", hostSet.winX, hostSet.winY, hostSet.winW, hostSet.winH);
   fprintf(f, "hk_modifier=%s\n", key_name(hostSet.modifier));
   for (int i = 0; i < HK_ACTIONS; i++) {
     fprintf(f, "hk_%s=%s\n", hotkeyIds[i], key_name(hostSet.hotkey[i]));
@@ -1806,6 +1860,7 @@ static bool ds_running(void) { return running != 0; }
 enum { M_RESUME, M_SAVE, M_LOAD, M_HOTKEYS, M_KEYBOARD, M_REWIND, M_FFSPEED, M_LCD, M_SWAP, M_QUIT,
        M_COUNT };
 static void run_game(const char *path, int maxFrames, const char *shot, bool fromList) {
+  listShown = false;
 #ifdef POCKET_DSPERATE
   const char *ext = strrchr(path, '.');
   if (ext && !strcasecmp(ext, ".nds")) {
@@ -2585,7 +2640,18 @@ int main(int argc, char **argv) {
   if (size &&
       (sscanf(size, "%dx%d", &winW, &winH) != 2 || winW < 160 || winH < 144 || winW > 8192 || winH > 8192))
     winW = W, winH = H;
-  window = SDL_CreateWindow(PD_HOST_NAME, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+  // The window where it was last time, if that's still on a screen.
+  int winX = SDL_WINDOWPOS_CENTERED, winY = SDL_WINDOWPOS_CENTERED;
+  if (!size && hostSet.winW) {
+    winW = hostSet.winW, winH = hostSet.winH;
+    for (int d = 0; d < SDL_GetNumVideoDisplays(); d++) {
+      SDL_Rect b;
+      if (!SDL_GetDisplayBounds(d, &b) && hostSet.winX + 40 >= b.x && hostSet.winX + 40 < b.x + b.w &&
+          hostSet.winY + 20 >= b.y && hostSet.winY + 20 < b.y + b.h)
+        winX = hostSet.winX, winY = hostSet.winY;
+    }
+  }
+  window = SDL_CreateWindow(PD_HOST_NAME, winX, winY,
                             fullscreen ? display.w : winW, fullscreen ? display.h : winH,
                             fullscreen ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_RESIZABLE);
 #ifdef _WIN32
@@ -2639,6 +2705,7 @@ int main(int argc, char **argv) {
     /* DATA/roms, then the folders POCKET_ROM_DIRS names (colon-separated: the PortMaster launcher passes the
      * firmware's own gba / gb / gbc / nds folders), by file name. Those hold every other game too, so only their
      * Pokemon games are listed (pokemon_rom); DATA/roms lists whatever was put there. */
+  list_again:; // games were added from the list: list the folders again
     static char *paths[1024];
     int count = 0;
     char dirs[4096];
@@ -2664,7 +2731,8 @@ int main(int argc, char **argv) {
     library_open(paths, count, root, savesDir, &libraryHost);
     int ticks = 0;
     bool keyPage = false; // the KEYBOARD page over the game list
-    while (running && !library_quit()) {
+    while (running && !library_quit() && !library_reload_wanted()) {
+      listShown = true;
       events();
       repeat_directions();
       static const int LIB_KEYS[][2] = {{A, LIB_A},       {B, LIB_B},         {X, LIB_X},           {Y, LIB_Y},
@@ -2779,10 +2847,13 @@ int main(int argc, char **argv) {
       }
       SDL_Delay(16);
     }
+    bool again = running && !library_quit() && library_reload_wanted();
     library_close();
     library_textures_free();
     for (int i = 0; i < count; i++)
       free(paths[i]);
+    if (again)
+      goto list_again;
   }
   if (js)
     SDL_JoystickClose(js);
@@ -2798,6 +2869,11 @@ int main(int argc, char **argv) {
   if (lcdTexture)
     SDL_DestroyTexture(lcdTexture);
   SDL_DestroyRenderer(renderer);
+  if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) && !getenv("POCKET_WINDOW")) { // its place, for next time
+    SDL_GetWindowPosition(window, &hostSet.winX, &hostSet.winY);
+    SDL_GetWindowSize(window, &hostSet.winW, &hostSet.winH);
+    host_save();
+  }
   SDL_DestroyWindow(window);
   SDL_Quit();
   return appError;
