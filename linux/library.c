@@ -44,6 +44,7 @@ void lib_draw_logo_24(struct pd_canvas *c, int x, int y);
 #define HEADER_H 30
 #define PILL_H 22
 #define GAP 8
+#define LEGEND_H 28         // the button legend's height: the pages end above it, so it never covers a game or a row
 
 enum console { C_GB, C_GBC, C_GBA, C_DS };
 enum view { V_ALL, V_FAV, V_RECENT, V_GB, V_GBC, V_GBA, V_DS, V_HACKS, V_COUNT };
@@ -1837,12 +1838,12 @@ void library_draw(struct pd_canvas *c) {
     int py = M + HEADER_H + GAP;
     draw_pills(c, x, py, w);
     contentY = py + PILL_H + GAP;
-    contentH = c->h - contentY;
+    contentH = c->h - contentY - M - LEGEND_H - GAP / 2;
     draw_games(c);
   } else {
     draw_header(c, x, w, page == P_TOOLS ? "TOOLS" : "SETTINGS", false);
     contentY = M + HEADER_H + GAP;
-    contentH = c->h - contentY - M;
+    contentH = c->h - contentY - M - LEGEND_H - GAP / 2;
     if (page == P_TOOLS)
       draw_tools(c);
     else
@@ -1897,7 +1898,7 @@ void library_draw_top(struct pd_canvas *c, uint32_t clear) {
     int n = gamesPage ? 3 : 2, w = 10;
     for (int i = 0; i < n; i++)
       w += 22 + pd_text_width(gamesPage ? GAMES_LEGEND[i][1] : PAGE_LEGEND[i][1]) + 10;
-    int h = 28, x = c->w - M - w, y = c->h - M - h;
+    int h = LEGEND_H, x = c->w - M - w, y = c->h - M - h;
     int f = pd_title_box(c, x, y, w, h, PD_TITLE_FILL);
     int lx = x + f + 5;
     for (int i = 0; i < n; i++) {
