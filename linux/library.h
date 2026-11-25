@@ -49,6 +49,10 @@ void library_keys(unsigned down);
 void library_pointer(int x, int y, bool click, int wheel);
 /* A right click (or control-click) at (x, y): the game under it is picked and its menu opens; elsewhere a menu closes. */
 void library_context(int x, int y);
+/* Something dropped on the window (a file path or URL, an image's web address): the picked game's cover. */
+void library_drop(const char *what);
+/* Every frame: where the pointer is and whether the left button is down, for a scroll bar being dragged. */
+void library_hold(int x, int y, bool held);
 void library_tick(void);
 void library_draw(struct pd_canvas *c);
 int library_covers(struct lib_cover *out, int max);

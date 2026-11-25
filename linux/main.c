@@ -362,6 +362,7 @@ static int wheelSteps;     // the wheel's notches this frame (+ up), for RETRO_D
 static int mouseWindowX, mouseWindowY; // the pointer over the window, for the library (the cores get it normalised)
 static bool libraryClick;              // a left press this frame
 static bool libraryRightClick;         // a right press (or control-click) this frame: a game's menu
+static char libraryDropped[PATH_MAX * 2]; // a file or an image's address dropped on the window: the picked game's cover
 static int libraryWheel;               // wheel notches this frame (+ up)
 
 static void pointer_at(int x, int y) {
@@ -513,6 +514,10 @@ static void events(void) {
     if (e.type == SDL_MOUSEMOTION) {
       mouseWindowX = e.motion.x, mouseWindowY = e.motion.y;
       pointer_at(e.motion.x, e.motion.y);
+    }
+    if ((e.type == SDL_DROPFILE || e.type == SDL_DROPTEXT) && e.drop.file) {
+      snprintf(libraryDropped, sizeof libraryDropped, "%s", e.drop.file);
+      SDL_free(e.drop.file);
     }
     if (e.type == SDL_MOUSEWHEEL) {
       int steps = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
@@ -2735,11 +2740,16 @@ int main(int argc, char **argv) {
         kb_menu_build();
         libraryClick = libraryRightClick = false;
         libraryWheel = 0;
-      } else if (libraryClick || libraryRightClick || libraryWheel) {
+      } else {
         int ow, oh, s, w, h, x0, y0;
         library_viewport(&ow, &oh, &s, &w, &h, &x0, &y0);
         int mx = (mouseWindowX - x0) / s, my = (mouseWindowY - y0) / s;
-        if (mx >= 0 && my >= 0 && mx < w && my < h) {
+        library_hold(mx, my, pointerHeld); // a scroll bar being dragged follows the pointer
+        if (libraryDropped[0]) {
+          library_drop(libraryDropped);
+          libraryDropped[0] = 0;
+        }
+        if ((libraryClick || libraryRightClick || libraryWheel) && mx >= 0 && my >= 0 && mx < w && my < h) {
           if (libraryRightClick)
             library_context(mx, my);
           else
@@ -2755,6 +2765,7 @@ int main(int argc, char **argv) {
         appError = 0;
         library_pause(true); // no hashing or cover downloads while a game plays
         run_game(picked, 0, NULL, true); // the last game's result is the exit status
+        libraryDropped[0] = 0; // something dropped during the game wasn't meant as a cover
         library_pause(false);
         libraryClick = false; // a click in the game is not one in the library
         libraryWheel = 0;

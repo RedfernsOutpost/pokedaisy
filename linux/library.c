@@ -82,7 +82,8 @@ static bool grid = true, quit, menuOpen, closeAsk;
 static int faceColors; // BUTTON COLORS: 0 the app's (red A, yellow B, blue X, green Y), 1 green A, red B, blue X, yellow Y
 static int selected, scroll, columns = 4, menuCursor, settingsCursor, settingsScroll, toolCursor;
 static bool settingsFollow = true; // the SETTINGS list keeps the cursor in view; off while the wheel scrolls it
-static int settingsTotal, settingsView, settingsBarY; // its height, the part shown and the bar's top, for clicks
+static int settingsTotal, settingsView, settingsBarY, settingsBarH; // its height, the part shown, the bar's top and height
+static int barGrab = -1; // while the scroll bar is dragged: where on its thumb it was grabbed, else -1
 static const char *picked;
 static char notice[96];
 static unsigned noticeUntil;
@@ -99,6 +100,10 @@ struct lib_hit {
   int x, y, w, h, action, arg;
 };
 static struct lib_hit libHits[512];
+// A cover from the clipboard (after FIND COVER ONLINE): start watching, stop, and take one the watcher found.
+static void clip_start(int game);
+static void clip_stop(void);
+static void clip_apply(void);
 static int libHitCount;
 static void hit_add(int x, int y, int w, int h, int action, int arg) {
   if (w > 0 && h > 0 && libHitCount < (int)(sizeof libHits / sizeof *libHits))
@@ -1289,6 +1294,7 @@ void library_open(char *const *paths, int count, const char *data, const char *s
 }
 
 void library_close(void) {
+  clip_stop();
   if (worker) {
     SDL_AtomicSet(&stopWorker, 1);
     curl_kill(); // a download in flight ends now, not at its timeout
@@ -1305,6 +1311,7 @@ void library_close(void) {
 void library_pause(bool paused) { SDL_AtomicSet(&pauseWorker, paused); }
 
 void library_tick(void) {
+  clip_apply();
   bool renamed = false;
   for (int i = 0; i < gameCount; i++) {
     struct game *g = &games[i];
@@ -1417,6 +1424,7 @@ static void setting_step(int row, int dir) {
 }
 
 static void play(void) {
+  clip_stop();
   if (selected >= 0 && selected < shownCount)
     picked = games[shown[selected]].path;
 }
@@ -1455,8 +1463,161 @@ static void cover_search_online(const struct game *g) {
 #endif
   if (run_wait(argv))
     say("No browser to open");
-  else
+  else {
+#ifdef __APPLE__
+    clip_start((int)(g - games));
+    say("Right click an image > Copy Image: it's the cover");
+#else
     say("Save an image, then CHOOSE COVER");
+#endif
+  }
+}
+
+/* [path] (any image macOS reads on a Mac, PNG elsewhere) as [g]'s box, DATA/covers/<file>.box.png, replacing a fetched
+ * cover. Main thread only. */
+static bool cover_set_from_file(struct game *g, const char *path) {
+  char plain[PATH_MAX + 8], box[PATH_MAX + 8], tmp[PATH_MAX + 16], none[PATH_MAX + 8];
+  const char *dot = strrchr(g->file, '.');
+  int stem = dot ? (int)(dot - g->file) : (int)strlen(g->file);
+  snprintf(plain, sizeof plain, "%s/covers/%.*s.png", dataDir, stem, g->file);
+  snprintf(box, sizeof box, "%s/covers/%.*s.box.png", dataDir, stem, g->file);
+  snprintf(none, sizeof none, "%s/covers/%.*s.none", dataDir, stem, g->file);
+  snprintf(tmp, sizeof tmp, "%s.tmp", box);
+#ifdef __APPLE__
+  const char *argv[] = {"sips", "-s", "format", "png", path, "--out", tmp, NULL};
+#else
+  const char *argv[] = {"cp", path, tmp, NULL};
+#endif
+  bool made = run_wait(argv) == 0;
+  uint32_t *px = made ? malloc((size_t)COVER * COVER * 4) : NULL;
+  if (!px || !cover_png_square(tmp, COVER, px, true) || rename(tmp, box)) {
+    free(px);
+    remove(tmp);
+    say("That image can't be a cover");
+    return false;
+  }
+  remove(plain); // a fetched icon would come before the box next start
+  remove(none);
+  uint32_t *old = g->coverPx;
+  snprintf(g->coverFile, sizeof g->coverFile, "%s", box);
+  snprintf(g->coverPath, sizeof g->coverPath, "%s", box);
+  g->coverFit = true;
+  g->coverPx = px;
+  g->serial++;
+  SDL_MemoryBarrierRelease();
+  SDL_AtomicSet(&g->coverState, CS_READY);
+  free(old);
+  return true;
+}
+
+/* ---- a cover straight from the browser: after FIND COVER ONLINE, an image copied in the browser (right click >
+ * Copy Image) becomes that game's cover. A thread asks the clipboard once a second for 3 minutes; the first image
+ * that wasn't there when the search opened wins. An image dropped on the window does the same (library_drop). ---- */
+static SDL_atomic_t clipWatch, clipReady; // watching; an image is waiting in clipFile
+static int clipGame = -1;                 // games[] index the image is for
+static char clipFile[PATH_MAX];
+
+/* The clipboard's image (PNG, else TIFF) into [path]; false when it holds none. */
+static bool clip_dump(const char *path) {
+#ifdef __APPLE__
+  remove(path);
+  const char *argv[] = {"osascript", "-e", "on run argv",
+                        "-e", "try",
+                        "-e", "set d to the clipboard as «class PNGf»",
+                        "-e", "on error",
+                        "-e", "set d to the clipboard as «class TIFF»",
+                        "-e", "end try",
+                        "-e", "set f to open for access (POSIX file (item 1 of argv)) with write permission",
+                        "-e", "set eof f to 0",
+                        "-e", "write d to f",
+                        "-e", "close access f",
+                        "-e", "end run", path, NULL};
+  pid_t pid;
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+  int err = posix_spawnp(&pid, "osascript", &fa, NULL, (char *const *)argv, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  if (err)
+    return false;
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    ;
+  struct stat st;
+  return WIFEXITED(status) && !WEXITSTATUS(status) && !stat(path, &st) && st.st_size > 0;
+#else
+  (void)path;
+  return false;
+#endif
+}
+
+static uint64_t file_hash(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return 0;
+  uint64_t h = 1469598103934665603ull;
+  int ch;
+  while ((ch = getc(f)) != EOF)
+    h = (h ^ (unsigned char)ch) * 1099511628211ull;
+  fclose(f);
+  return h;
+}
+
+static int clip_watch(void *unused) {
+  (void)unused;
+  char base[PATH_MAX], cur[PATH_MAX];
+  snprintf(base, sizeof base, "%s/covers/.clipboard-before", dataDir);
+  snprintf(cur, sizeof cur, "%s/covers/.clipboard", dataDir);
+  uint64_t before = clip_dump(base) ? file_hash(base) : 0;
+  remove(base);
+  for (int t = 0; t < 180 && SDL_AtomicGet(&clipWatch); t++) {
+    SDL_Delay(1000);
+    if (!SDL_AtomicGet(&clipWatch) || SDL_AtomicGet(&pauseWorker))
+      continue;
+    if (clip_dump(cur) && file_hash(cur) != before) {
+      snprintf(clipFile, sizeof clipFile, "%s", cur);
+      SDL_MemoryBarrierRelease();
+      SDL_AtomicSet(&clipReady, 1);
+      break;
+    }
+  }
+  SDL_AtomicSet(&clipWatch, 0);
+  return 0;
+}
+
+static void clip_start(int game) {
+#ifdef __APPLE__
+  clipGame = game;
+  SDL_AtomicSet(&clipReady, 0);
+  if (SDL_AtomicCAS(&clipWatch, 0, 1)) {
+    SDL_Thread *t = SDL_CreateThread(clip_watch, "clipboard", NULL);
+    if (t)
+      SDL_DetachThread(t);
+    else
+      SDL_AtomicSet(&clipWatch, 0);
+  }
+#else
+  (void)game;
+#endif
+}
+
+static void clip_stop(void) {
+  SDL_AtomicSet(&clipWatch, 0);
+  SDL_AtomicSet(&clipReady, 0);
+  clipGame = -1;
+}
+
+/* library_tick: an image the watcher found becomes the game's cover. */
+static void clip_apply(void) {
+  if (!SDL_AtomicGet(&clipReady))
+    return;
+  SDL_MemoryBarrierAcquire();
+  SDL_AtomicSet(&clipReady, 0);
+  if (clipGame >= 0 && clipGame < gameCount && cover_set_from_file(&games[clipGame], clipFile))
+    say("Cover set from the clipboard");
+  remove(clipFile);
+  clipGame = -1;
 }
 
 static void cover_choose(struct game *g) {
@@ -1475,43 +1636,18 @@ static void cover_choose(struct game *g) {
   path[strcspn(path, "\r\n")] = 0;
   if (!path[0])
     return; // cancelled, or no picker
-  char plain[PATH_MAX + 8], box[PATH_MAX + 8], tmp[PATH_MAX + 16], none[PATH_MAX + 8];
-  const char *dot = strrchr(g->file, '.');
-  int stem = dot ? (int)(dot - g->file) : (int)strlen(g->file);
-  snprintf(plain, sizeof plain, "%s/covers/%.*s.png", dataDir, stem, g->file);
-  snprintf(box, sizeof box, "%s/covers/%.*s.box.png", dataDir, stem, g->file);
-  snprintf(none, sizeof none, "%s/covers/%.*s.none", dataDir, stem, g->file);
-  snprintf(tmp, sizeof tmp, "%s.tmp", box);
-#ifdef __APPLE__
-  const char *argv[] = {"sips", "-s", "format", "png", path, "--out", tmp, NULL};
-  bool made = run_wait(argv) == 0;
-#else
-  const char *argv[] = {"cp", path, tmp, NULL};
-  bool made = run_wait(argv) == 0;
-#endif
-  uint32_t *px = made ? malloc((size_t)COVER * COVER * 4) : NULL;
-  if (!px || !cover_png_square(tmp, COVER, px, true) || rename(tmp, box)) {
-    free(px);
-    remove(tmp);
-    say("That image can't be a cover");
-    return;
+  if (cover_set_from_file(g, path)) {
+    clip_stop();
+    say("Cover set");
   }
-  remove(plain); // a fetched icon would come before the box next start
-  remove(none);
-  uint32_t *old = g->coverPx;
-  snprintf(g->coverFile, sizeof g->coverFile, "%s", box);
-  snprintf(g->coverPath, sizeof g->coverPath, "%s", box);
-  g->coverFit = true;
-  g->coverPx = px;
-  g->serial++;
-  SDL_MemoryBarrierRelease();
-  SDL_AtomicSet(&g->coverState, CS_READY);
-  free(old);
-  say("Cover set");
 }
 #else
 static void cover_search_online(const struct game *g) { (void)g; }
 static void cover_choose(struct game *g) { (void)g; }
+static bool cover_set_from_file(struct game *g, const char *path) { (void)g; (void)path; return false; }
+static void clip_start(int game) { (void)game; }
+static void clip_stop(void) {}
+static void clip_apply(void) {}
 #endif
 
 static void menu_choose(void) {
@@ -2123,8 +2259,8 @@ static void draw_settings(struct pd_canvas *c) {
       th = 12, ty = by + (bh - th) * settingsScroll / most;
     pd_fill(c, bx, by, 4, bh, PD_DIVIDER);
     pd_fill(c, bx, ty, 4, th, PD_VALUE);
-    settingsBarY = by;
-    hit_add(bx - 4, by, 12, bh, LIB_HIT_SCROLLBAR, bh);
+    settingsBarY = by, settingsBarH = bh;
+    hit_add(bx - 4, by, 12, bh, LIB_HIT_SCROLLBAR, ty - by); // arg: the thumb's top, for a grab
   }
 }
 
@@ -2284,6 +2420,65 @@ static void wheel_games(int dir) {
   focus = F_GAMES;
 }
 
+void library_drop(const char *what) {
+#ifndef _WIN32
+  if (selected < 0 || selected >= shownCount || !what || !*what)
+    return;
+  struct game *g = &games[shown[selected]];
+  char path[PATH_MAX];
+  if (!strncmp(what, "file://", 7)) { // a file URL: its path, %XX undone
+    size_t o = 0;
+    for (const char *p = what + 7; *p && o + 1 < sizeof path; p++)
+      if (*p == '%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])) {
+        char hex[3] = {p[1], p[2], 0};
+        path[o++] = (char)strtol(hex, NULL, 16);
+        p += 2;
+      } else
+        path[o++] = *p;
+    path[o] = 0;
+  } else if (!strncmp(what, "http://", 7) || !strncmp(what, "https://", 8)) { // an image dragged out of the browser
+    snprintf(path, sizeof path, "%s/covers/.dropped", dataDir);
+    const char *argv[] = {"curl", "-q", "-fsSL", "--proto", "=http,https", "--connect-timeout", "8", "--max-time", "20",
+                          "--max-filesize", "20000000", "-o", path, what, NULL};
+    if (run_wait(argv)) {
+      remove(path);
+      say("That image didn't download: try Copy Image");
+      return;
+    }
+  } else if (what[0] == '/')
+    snprintf(path, sizeof path, "%s", what);
+  else {
+    say("Drop an image, or use Copy Image");
+    return;
+  }
+  path[strcspn(path, "\r\n")] = 0;
+  if (cover_set_from_file(g, path)) {
+    clip_stop();
+    say("Cover set");
+  }
+  if (strstr(path, "/covers/.dropped"))
+    remove(path);
+#else
+  (void)what;
+#endif
+}
+
+void library_hold(int x, int y, bool held) {
+  (void)x;
+  if (barGrab < 0)
+    return;
+  if (!held || page != P_SETTINGS) {
+    barGrab = -1;
+    return;
+  }
+  int most = settingsTotal - settingsView, th = settingsBarH * settingsView / (settingsTotal ? settingsTotal : 1);
+  if (th < 12)
+    th = 12;
+  if (most > 0 && settingsBarH > th)
+    settingsScroll = (y - barGrab - settingsBarY) * most / (settingsBarH - th); // draw_settings keeps it in range
+  settingsFollow = false;
+}
+
 void library_context(int x, int y) {
   if (closeAsk)
     return;
@@ -2330,8 +2525,14 @@ void library_pointer(int x, int y, bool click, int wheel) {
     if (!h)
       return;
     if (h->action == LIB_HIT_SCROLLBAR) {
-      if (h->arg > 0 && settingsTotal > settingsView)
-        settingsScroll = (y - settingsBarY) * settingsTotal / h->arg - settingsView / 2;
+      // A press on the thumb grabs it where it was pressed; on the track, the thumb jumps there (centred) and is held.
+      int most = settingsTotal - settingsView, th = settingsBarH * settingsView / (settingsTotal ? settingsTotal : 1);
+      if (th < 12)
+        th = 12;
+      int top = settingsBarY + h->arg;
+      barGrab = y >= top && y < top + th ? y - top : th / 2;
+      if (most > 0 && settingsBarH > th)
+        settingsScroll = (y - barGrab - settingsBarY) * most / (settingsBarH - th);
       settingsFollow = false;
       focus = F_GAMES;
       return;
