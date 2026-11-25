@@ -2576,6 +2576,14 @@ int main(int argc, char **argv) {
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   audio_open();
   rawTrimui = getenv("POCKET_RAW_TRIMUI") && !strcmp(getenv("POCKET_RAW_TRIMUI"), "1");
+#ifdef __APPLE__
+  // Ekipad (an iPhone as a Mac controller) in its Generic Gamepad route: a virtual HID pad SDL has no mapping for.
+  // 13 buttons (A B X Y L1 R1 L2 R2 L3 R3 START SELECT HOME), a hat, sticks on X/Y and Z/Rz, triggers on Rx/Ry.
+  SDL_GameControllerAddMapping("0300164309120000ade4000000000000,Ekipad Pad,a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,"
+                               "rightshoulder:b5,lefttrigger:a3,righttrigger:a4,leftstick:b8,rightstick:b9,start:b10,"
+                               "back:b11,guide:b12,dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8,leftx:a0,lefty:a1,"
+                               "rightx:a2,righty:a5,platform:Mac OS X,");
+#endif
   snprintf(path, sizeof path, "%s/gamecontrollerdb.txt", root);
   if (access(path, R_OK) == 0) {
     int added = SDL_GameControllerAddMappingsFromFile(path);
