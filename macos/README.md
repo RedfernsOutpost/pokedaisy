@@ -35,4 +35,7 @@ its `roms/` folder and pick one from the game list. Saves, states and settings s
   `third_party/patches/dsperate-macos.patch` (applied at configure time, Apple only) covers Apple clang and Mach-O.
 - The cores end in `.dylib`, and the frontend finds its own folder with `_NSGetExecutablePath` (there is no `/proc`).
 - **Xbox controllers go through macOS's GameController framework** (`SDL_HINT_JOYSTICK_HIDAPI_XBOX` is 0 on Apple).
-  SDL's own HIDAPI Xbox driver opens a virtual Xbox controller (an iPhone controller app's) but gets none of its input.
+  SDL's own HIDAPI Xbox driver opens a virtual Xbox controller ([Ekipad](https://redfernsoutpost.com/ekipad/), an iPhone controller app) but gets none of its input.
+- **Ekipad's Generic Gamepad route has a built-in mapping**, so that virtual controller works too (SDL has none for it).
+- **In the game list, a click picks a game and a second click plays it**, as in Finder. Keys and controllers are
+  unchanged, and other platforms keep one click (a Steam Deck's touch screen arrives as clicks).

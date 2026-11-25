@@ -2016,9 +2016,19 @@ void library_pointer(int x, int y, bool click, int wheel) {
       focus = F_GAMES;
     } else if (h->action == LIB_HIT_GAME) {
       if (h->arg >= 0 && h->arg < shownCount) {
+#ifdef __APPLE__
+        // On a Mac the first click picks the game and a second click on it plays it, as in Finder (one the keys moved
+        // to still takes two). Elsewhere a click or a tap plays it straight away.
+        static int clicked = -1;
+        bool again = h->arg == clicked && h->arg == selected && focus == F_GAMES;
+        clicked = again ? -1 : h->arg;
+#else
+        bool again = true;
+#endif
         selected = h->arg;
         focus = F_GAMES;
-        play();
+        if (again)
+          play();
       }
     } else if (h->action == LIB_HIT_SETTING) {
       settingsCursor = h->arg;
