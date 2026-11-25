@@ -1420,6 +1420,98 @@ static void play(void) {
 }
 
 /* The game's B menu (PLAY / FAVORITE / CANCEL): A, or a click on its row. */
+/* ---- a cover of the player's choosing: FIND COVER ONLINE opens an image search for the game in the browser,
+ * CHOOSE COVER takes an image file (any kind on a Mac, PNG elsewhere) as the game's box, DATA/covers/<file>.box.png. ---- */
+#define MENU_ROWS 5 // PLAY, FAVORITE, FIND COVER ONLINE, CHOOSE COVER, CANCEL
+#ifndef _WIN32
+static int run_wait(const char *const *argv) {
+  pid_t pid;
+  if (posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ))
+    return -1;
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    ;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void cover_search_online(const struct game *g) {
+  char q[512], url[1024];
+  snprintf(q, sizeof q, "%s box art", g->title);
+  int u = snprintf(url, sizeof url, "https://www.google.com/search?tbm=isch&q=");
+  for (const unsigned char *p = (const unsigned char *)q; *p && u + 4 < (int)sizeof url; p++)
+    if (*p == ' ')
+      url[u++] = '+';
+    else if (isalnum(*p) || strchr("-._~", *p))
+      url[u++] = (char)*p;
+    else
+      u += snprintf(url + u, sizeof url - (size_t)u, "%%%02X", *p);
+  url[u] = 0;
+#ifdef __APPLE__
+  const char *argv[] = {"open", url, NULL};
+#else
+  const char *argv[] = {"xdg-open", url, NULL};
+#endif
+  if (run_wait(argv))
+    say("No browser to open");
+  else
+    say("Save an image, then CHOOSE COVER");
+}
+
+static void cover_choose(struct game *g) {
+#ifdef __APPLE__
+  FILE *p = popen("osascript -e 'POSIX path of (choose file of type {\"public.image\"} with prompt \"Choose a cover\")' "
+                  "2>/dev/null", "r");
+#else
+  FILE *p = popen("zenity --file-selection --title='Choose a cover (PNG)' --file-filter='PNG | *.png' 2>/dev/null", "r");
+#endif
+  char path[PATH_MAX] = "";
+  if (p) {
+    if (!fgets(path, sizeof path, p))
+      path[0] = 0;
+    pclose(p);
+  }
+  path[strcspn(path, "\r\n")] = 0;
+  if (!path[0])
+    return; // cancelled, or no picker
+  char plain[PATH_MAX + 8], box[PATH_MAX + 8], tmp[PATH_MAX + 16], none[PATH_MAX + 8];
+  const char *dot = strrchr(g->file, '.');
+  int stem = dot ? (int)(dot - g->file) : (int)strlen(g->file);
+  snprintf(plain, sizeof plain, "%s/covers/%.*s.png", dataDir, stem, g->file);
+  snprintf(box, sizeof box, "%s/covers/%.*s.box.png", dataDir, stem, g->file);
+  snprintf(none, sizeof none, "%s/covers/%.*s.none", dataDir, stem, g->file);
+  snprintf(tmp, sizeof tmp, "%s.tmp", box);
+#ifdef __APPLE__
+  const char *argv[] = {"sips", "-s", "format", "png", path, "--out", tmp, NULL};
+  bool made = run_wait(argv) == 0;
+#else
+  const char *argv[] = {"cp", path, tmp, NULL};
+  bool made = run_wait(argv) == 0;
+#endif
+  uint32_t *px = made ? malloc((size_t)COVER * COVER * 4) : NULL;
+  if (!px || !cover_png_square(tmp, COVER, px, true) || rename(tmp, box)) {
+    free(px);
+    remove(tmp);
+    say("That image can't be a cover");
+    return;
+  }
+  remove(plain); // a fetched icon would come before the box next start
+  remove(none);
+  uint32_t *old = g->coverPx;
+  snprintf(g->coverFile, sizeof g->coverFile, "%s", box);
+  snprintf(g->coverPath, sizeof g->coverPath, "%s", box);
+  g->coverFit = true;
+  g->coverPx = px;
+  g->serial++;
+  SDL_MemoryBarrierRelease();
+  SDL_AtomicSet(&g->coverState, CS_READY);
+  free(old);
+  say("Cover set");
+}
+#else
+static void cover_search_online(const struct game *g) { (void)g; }
+static void cover_choose(struct game *g) { (void)g; }
+#endif
+
 static void menu_choose(void) {
   if (selected < 0 || selected >= shownCount) {
     menuOpen = false;
@@ -1433,7 +1525,10 @@ static void menu_choose(void) {
     g->favSet = true;
     state_save();
     relist();
-  }
+  } else if (menuCursor == 2)
+    cover_search_online(g);
+  else if (menuCursor == 3)
+    cover_choose(g);
   menuOpen = false;
 }
 
@@ -1487,9 +1582,9 @@ void library_keys(unsigned down) {
   }
   if (menuOpen) {
     if (down & LIB_UP)
-      menuCursor = (menuCursor + 2) % 3;
+      menuCursor = (menuCursor + MENU_ROWS - 1) % MENU_ROWS;
     if (down & LIB_DOWN)
-      menuCursor = (menuCursor + 1) % 3;
+      menuCursor = (menuCursor + 1) % MENU_ROWS;
     if (down & LIB_A)
       menu_choose();
     if (down & (LIB_B | LIB_START))
@@ -2117,11 +2212,11 @@ void library_draw_top(struct pd_canvas *c, uint32_t clear) {
   }
   if (menuOpen && selected < shownCount) {
     const struct game *g = &games[shown[selected]];
-    const char *rows[3] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "CANCEL"};
-    int w = 240, h = 2 * 6 + 24 + 3 * 24 + 4;
+    const char *rows[MENU_ROWS] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "FIND COVER ONLINE", "CHOOSE COVER", "CANCEL"};
+    int w = 240, h = 2 * 6 + 24 + MENU_ROWS * 24 + 4;
     int x = (c->w - w) / 2, y = (c->h - h) / 2;
-    int f = window(c, x, y, w, h, g->title, rows, 3, menuCursor);
-    for (int i = 0; i < 3; i++)
+    int f = window(c, x, y, w, h, g->title, rows, MENU_ROWS, menuCursor);
+    for (int i = 0; i < MENU_ROWS; i++)
       hit_add(x + f + 2, y + f + 4 + 24 + i * 24, w - 2 * f - 4, 22, LIB_HIT_MENU, i);
   }
   if (closeAsk) {
@@ -2192,7 +2287,7 @@ void library_pointer(int x, int y, bool click, int wheel) {
       return;
     }
     if (wheel) {
-      int n = menuOpen ? 3 : 2, dir = wheel > 0 ? -1 : 1;
+      int n = menuOpen ? MENU_ROWS : 2, dir = wheel > 0 ? -1 : 1;
       for (int i = wheel > 0 ? wheel : -wheel; i > 0; i--)
         menuCursor = (menuCursor + dir + n) % n;
     }
