@@ -131,7 +131,9 @@ enum {
   LOADKEY,
   NKEYS
 };
-static SDL_GameController *controller;
+static SDL_GameController *controller; // the pad last pressed (its name in SETTINGS); every pad in pads[] reaches the game
+static SDL_GameController *pads[8];
+static int padCount;
 static bool rawTrimui;
 static bool swapFace; // the host menu's A/B BUTTONS: SWAPPED (host.ini swap_ab)
 /* The PANEL presets: the screen the core is told to lay its canvas out for. 0 is the window's own size. */
@@ -308,22 +310,36 @@ static void controller_added(int index) {
             SDL_JoystickNameForIndex(index) ? SDL_JoystickNameForIndex(index) : "?", guid);
     return;
   }
-  if (controller)
+  // Every pad is opened, not only the first: a stale virtual pad (one an iPhone controller app left behind) listed
+  // first would otherwise take the place of the one being pressed.
+  SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(index);
+  for (int i = 0; i < padCount; i++)
+    if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pads[i])) == id)
+      return;
+  if (padCount == (int)(sizeof pads / sizeof *pads))
     return;
-  controller = SDL_GameControllerOpen(index);
-  if (controller)
-    fprintf(stderr, "Controller: %s\n", SDL_GameControllerName(controller));
+  SDL_GameController *pad = SDL_GameControllerOpen(index);
+  if (!pad)
+    return;
+  pads[padCount++] = pad;
+  if (!controller)
+    controller = pad;
+  fprintf(stderr, "Controller: %s\n", SDL_GameControllerName(pad));
 }
 static void controller_removed(SDL_JoystickID id) {
-  if (!controller || SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller)) != id)
+  int at = -1;
+  for (int i = 0; i < padCount; i++)
+    if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pads[i])) == id)
+      at = i;
+  if (at < 0)
     return;
-  SDL_GameControllerClose(controller);
-  controller = NULL;
+  SDL_GameController *gone = pads[at];
+  pads[at] = pads[--padCount];
+  SDL_GameControllerClose(gone);
+  if (controller == gone)
+    controller = padCount ? pads[0] : NULL;
   inputReset = true;
   held = 0; // nothing stays pressed on a pad that's gone
-  for (int i = 0; i < SDL_NumJoysticks() && !controller; i++)
-    if (SDL_IsGameController(i))
-      controller_added(i);
 }
 /* The pointer (a touch screen, or the mouse): where on the core's frame, for RETRO_DEVICE_POINTER. */
 static SDL_Rect frameRect;
@@ -345,6 +361,7 @@ static int pointerPulse;
 static int wheelSteps;     // the wheel's notches this frame (+ up), for RETRO_DEVICE_MOUSE
 static int mouseWindowX, mouseWindowY; // the pointer over the window, for the library (the cores get it normalised)
 static bool libraryClick;              // a left press this frame
+static bool libraryRightClick;         // a right press (or control-click) this frame: a game's menu
 static int libraryWheel;               // wheel notches this frame (+ up)
 
 static void pointer_at(int x, int y) {
@@ -436,6 +453,11 @@ static void events(void) {
       lastKey = (int)e.key.keysym.sym; // the KEYBOARD page's next key: the game sees nothing of it
     else if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) && !e.key.repeat)
       key(keyboard(e.key.keysym.sym), e.type == SDL_KEYDOWN);
+    if (e.type == SDL_CONTROLLERBUTTONDOWN) { // the pad pressed is the one in use
+      SDL_GameController *pad = SDL_GameControllerFromInstanceID(e.cbutton.which);
+      if (pad)
+        controller = pad;
+    }
     if (e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP)
       key(face(controller_button(e.cbutton.button)), e.type == SDL_CONTROLLERBUTTONDOWN);
     if (e.type == SDL_CONTROLLERAXISMOTION) {
@@ -470,6 +492,11 @@ static void events(void) {
       mouseWindowX = e.button.x, mouseWindowY = e.button.y;
       pointer_at(e.button.x, e.button.y);
       pointerHeld = e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT;
+      if (e.type == SDL_MOUSEBUTTONDOWN && (e.button.button == SDL_BUTTON_RIGHT ||
+                                            (pointerHeld && (SDL_GetModState() & KMOD_CTRL)))) {
+        libraryRightClick = true;
+        pointerHeld = false;
+      }
       if (pointerHeld) {
         pointerPulse = 1; // a click the core sees even when press and release fall in one frame
         libraryClick = true;
@@ -498,7 +525,7 @@ static void events(void) {
       pointerHeld = false; // its button-up may go to the window that took the focus
       pointerPulse = 0;
       pointerDown = false;
-      libraryClick = false;
+      libraryClick = libraryRightClick = false;
       libraryWheel = 0;
     }
     if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
@@ -2597,7 +2624,7 @@ int main(int argc, char **argv) {
     int added = SDL_GameControllerAddMappingsFromFile(path);
     fprintf(stderr, "Controller mappings from %s: %d\n", path, added);
   }
-  for (int i = 0; i < SDL_NumJoysticks() && !controller; i++)
+  for (int i = 0; i < SDL_NumJoysticks(); i++)
     if (SDL_IsGameController(i))
       controller_added(i);
   SDL_Joystick *js = !controller && rawTrimui && SDL_NumJoysticks() ? SDL_JoystickOpen(0) : NULL;
@@ -2706,15 +2733,19 @@ int main(int argc, char **argv) {
           keyPage = false; // a click beside the page closes it
         }
         kb_menu_build();
-        libraryClick = false;
+        libraryClick = libraryRightClick = false;
         libraryWheel = 0;
-      } else if (libraryClick || libraryWheel) {
+      } else if (libraryClick || libraryRightClick || libraryWheel) {
         int ow, oh, s, w, h, x0, y0;
         library_viewport(&ow, &oh, &s, &w, &h, &x0, &y0);
         int mx = (mouseWindowX - x0) / s, my = (mouseWindowY - y0) / s;
-        if (mx >= 0 && my >= 0 && mx < w && my < h)
-          library_pointer(mx, my, libraryClick, libraryWheel);
-        libraryClick = false;
+        if (mx >= 0 && my >= 0 && mx < w && my < h) {
+          if (libraryRightClick)
+            library_context(mx, my);
+          else
+            library_pointer(mx, my, libraryClick, libraryWheel);
+        }
+        libraryClick = libraryRightClick = false;
         libraryWheel = 0;
       }
       const char *game = library_picked();
@@ -2744,8 +2775,9 @@ int main(int argc, char **argv) {
   }
   if (js)
     SDL_JoystickClose(js);
-  if (controller)
-    SDL_GameControllerClose(controller);
+  while (padCount)
+    SDL_GameControllerClose(pads[--padCount]);
+  controller = NULL;
   if (audio)
     SDL_CloseAudioDevice(audio);
   if (frameTexture)
