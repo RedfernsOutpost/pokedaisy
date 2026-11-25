@@ -459,6 +459,7 @@ enum net {
 /* curl runs without a shell, the key in a config file only we can read (never on its command line, which `ps` shows);
  * library_close kills a running one, so quitting doesn't wait for a download. */
 static char curlConfig[PATH_MAX];
+static bool curlWithKey; // curl_run hands curl the key's config only while this is set: other hosts never see the key
 static SDL_mutex *curlLock;
 #ifndef _WIN32
 static pid_t curlPid;
@@ -508,8 +509,11 @@ static int curl_run(const char *const *args, char **out) {
   const char *argv[24];
   int n = 0;
   argv[n++] = "curl";
-  argv[n++] = "-K";
-  argv[n++] = curlConfig;
+  argv[n++] = "-q"; // no ~/.curlrc
+  if (curlWithKey && curlConfig[0]) {
+    argv[n++] = "-K";
+    argv[n++] = curlConfig;
+  }
   for (int i = 0; args[i] && n < 23; i++)
     argv[n++] = args[i];
   argv[n] = NULL;
@@ -843,6 +847,186 @@ static enum net sgdb_fetch(struct game *g) {
   return NET_OK;
 }
 
+/* ---- libretro-thumbnails, no key: RetroArch's box art collection (github.com/libretro-thumbnails), named the No-Intro
+ * way. For a retail game SteamGridDB has nothing for, or when there's no key. Each system's Named_Boxarts list comes
+ * from GitHub's API once per pass (two calls); the box goes into DATA/covers/<file>.box.png, drawn whole. ---- */
+#define LR_RAW "https://raw.githubusercontent.com/libretro-thumbnails/"
+#define LR_API "https://api.github.com/repos/libretro-thumbnails/"
+static const char *const LR_REPOS[4] = {"Nintendo_-_Game_Boy", "Nintendo_-_Game_Boy_Color", "Nintendo_-_Game_Boy_Advance",
+                                        "Nintendo_-_Nintendo_DS"};
+static char *lrIndex[4]; // a system's box names ("<name>.png\n" each), NULL until read
+static bool lrTried[4];
+
+/* GET [url] without the key: NET_OK with the body (malloc'd), NET_NONE on a 404, NET_STOP without curl, else NET_FAIL. */
+static enum net lr_get(const char *url, char **body) {
+  *body = NULL;
+  if (!url_safe(url))
+    return NET_NONE;
+  if (stopping())
+    return NET_FAIL;
+  const char *args[] = {"-sS", "--connect-timeout", "8", "--max-time", "30", "-w", "\n%{http_code}", url, NULL};
+  char *out = NULL;
+  int rc = curl_run(args, &out);
+  if (rc < 0)
+    return SDL_AtomicGet(&stopWorker) ? NET_FAIL : NET_STOP;
+  if (rc || !out)
+    return NET_FAIL;
+  char *nl = strrchr(out, '\n');
+  int code = nl ? atoi(nl + 1) : 0;
+  if (nl)
+    *nl = 0;
+  if (code == 200) {
+    *body = out;
+    return NET_OK;
+  }
+  free(out);
+  return code == 404 ? NET_NONE : NET_FAIL; // 403 / 429: GitHub's hourly limit, next start
+}
+
+/* GitHub's JSON is spaced ("key": "value"): the next [key]'s string value from [from] into out (\" and \\ unescaped);
+ * returns where that value ends, NULL when there's no more. */
+static const char *lr_json(const char *from, const char *key, char *out, size_t len) {
+  char pat[32];
+  snprintf(pat, sizeof pat, "\"%s\"", key);
+  for (const char *a = strstr(from, pat); a; a = strstr(a + 1, pat)) {
+    const char *v = a + strlen(pat);
+    while (*v == ' ')
+      v++;
+    if (*v++ != ':')
+      continue;
+    while (*v == ' ')
+      v++;
+    if (*v++ != '"')
+      continue;
+    size_t o = 0;
+    for (; *v && *v != '"'; v++) {
+      if (*v == '\\' && v[1])
+        v++;
+      if (o + 1 < len)
+        out[o++] = *v;
+    }
+    out[o] = 0;
+    return v;
+  }
+  return NULL;
+}
+
+static void lr_index(int sys) {
+  if (lrTried[sys])
+    return;
+  lrTried[sys] = true;
+  char url[256], sha[64] = "", *body = NULL;
+  snprintf(url, sizeof url, LR_API "%s/git/trees/master", LR_REPOS[sys]);
+  if (lr_get(url, &body) != NET_OK)
+    return;
+  const char *at = strstr(body, "\"Named_Boxarts\"");
+  if (at)
+    lr_json(at, "sha", sha, sizeof sha);
+  free(body);
+  for (const char *p = sha; *p; p++)
+    if (!isxdigit((unsigned char)*p))
+      sha[0] = 0;
+  if (!sha[0])
+    return;
+  snprintf(url, sizeof url, LR_API "%s/git/trees/%s", LR_REPOS[sys], sha);
+  if (lr_get(url, &body) != NET_OK)
+    return;
+  size_t cap = strlen(body) + 1, len = 0;
+  char *idx = malloc(cap);
+  char name[512];
+  for (at = idx ? lr_json(body, "path", name, sizeof name) : NULL; at; at = lr_json(at, "path", name, sizeof name)) {
+    size_t n = strlen(name);
+    if (n < 5 || strcasecmp(name + n - 4, ".png") || strchr(name, '\n') || len + n + 2 > cap)
+      continue;
+    memcpy(idx + len, name, n);
+    len += n;
+    idx[len++] = '\n';
+  }
+  if (idx)
+    idx[len] = 0;
+  lrIndex[sys] = idx;
+  free(body);
+}
+
+/* The box for [file]: its own name (the libretro way: no extension, &*\/:`<>?\| as _), else the same title in another
+ * region or revision, USA first, then World, then Europe; never a beta, prototype or demo. */
+static bool lr_pick(int sys, const char *file, char *out, size_t len) {
+  char want[300], prefix[300], line[600];
+  const char *dot = strrchr(file, '.');
+  size_t fl = dot ? (size_t)(dot - file) : strlen(file), n = 0;
+  for (size_t i = 0; i < fl && n + 1 < sizeof want; i++)
+    want[n++] = strchr("&*/:`<>?\\|", file[i]) ? '_' : file[i];
+  want[n] = 0;
+  snprintf(prefix, sizeof prefix, "%s", want);
+  char *paren = strstr(prefix, " (");
+  if (paren)
+    *paren = 0;
+  size_t pl = strlen(prefix);
+  int bestScore = 0;
+  for (const char *at = lrIndex[sys]; at && *at;) {
+    const char *end = strchr(at, '\n');
+    size_t ll = end ? (size_t)(end - at) : strlen(at);
+    if (ll < sizeof line && ll > 4) {
+      memcpy(line, at, ll);
+      line[ll - 4] = 0; // without .png
+      int score = 0;
+      if (!strcmp(line, want))
+        score = 100;
+      else if (!strncmp(line, prefix, pl) && !strncmp(line + pl, " (", 2) && !strstr(line, "(Beta") &&
+               !strstr(line, "(Proto") && !strstr(line, "(Demo") && !strstr(line, "(Kiosk") && !strstr(line, "(Sample"))
+        score = strstr(line, "USA") ? 4 : strstr(line, "World") ? 3 : strstr(line, "Europe") ? 2 : 1;
+      if (score > bestScore) {
+        bestScore = score;
+        snprintf(out, len, "%s", line);
+      }
+    }
+    if (!end)
+      break;
+    at = end + 1;
+  }
+  return bestScore > 0;
+}
+
+static enum net lr_fetch(struct game *g) {
+  if (g->hack)
+    return NET_NONE; // a hack isn't its retail game's box
+  int sys = g->console == C_GB ? 0 : g->console == C_GBC ? 1 : g->console == C_GBA ? 2 : 3;
+  lr_index(sys);
+  if (!lrIndex[sys])
+    return NET_FAIL;
+  char name[512];
+  if (!lr_pick(sys, g->file, name, sizeof name)) {
+    fprintf(stderr, "Cover: %s: not in libretro-thumbnails\n", g->file);
+    return NET_NONE;
+  }
+  char url[1800];
+  int u = snprintf(url, sizeof url, LR_RAW "%s/master/Named_Boxarts/", LR_REPOS[sys]);
+  for (const unsigned char *p = (const unsigned char *)name; *p && u + 8 < (int)sizeof url; p++)
+    if (isalnum(*p) || strchr("-._~", *p))
+      url[u++] = (char)*p;
+    else
+      u += snprintf(url + u, sizeof url - (size_t)u, "%%%02X", *p);
+  url[u] = 0;
+  strncat(url, ".png", sizeof url - strlen(url) - 1);
+  char box[PATH_MAX + 8], tmp[PATH_MAX + 16];
+  snprintf(box, sizeof box, "%.*s.box.png", (int)strlen(g->coverFile) - 4, g->coverFile);
+  snprintf(tmp, sizeof tmp, "%s.tmp", box);
+  if (!url_safe(url))
+    return NET_NONE;
+  if (stopping())
+    return NET_FAIL;
+  const char *args[] = {"-fsSL", "--connect-timeout", "8", "--max-time", "30", "-o", tmp, url, NULL};
+  int rc = curl_run(args, NULL);
+  if (rc || rename(tmp, box)) {
+    remove(tmp);
+    return rc < 0 && !SDL_AtomicGet(&stopWorker) ? NET_STOP : NET_FAIL;
+  }
+  snprintf(g->coverFile, sizeof g->coverFile, "%s", box);
+  g->coverFit = true;
+  fprintf(stderr, "Cover: %s: libretro-thumbnails, %s\n", g->file, name);
+  return NET_OK;
+}
+
 /* ---- the worker: covers, then hashes ---- */
 
 static int work(void *unused) {
@@ -882,9 +1066,10 @@ static int work(void *unused) {
     SDL_MemoryBarrierRelease();
     SDL_AtomicSet(&g->hashed, 2);
   }
-  // No art from the firmware: SteamGridDB's, with the player's key. ".none" only once it answered there's nothing.
+  // No art from the firmware: SteamGridDB's with the player's key, else libretro-thumbnails' box (no key).
+  // ".none" only once every source asked answered there's nothing.
   bool config = sgdbKey[0] && curl_config_write();
-  for (int i = 0, failed = 0; config && i < gameCount && !stopping(); i++) {
+  for (int i = 0, failed = 0, lrFailed = 0; i < gameCount && !stopping(); i++) {
     struct game *g = &games[i];
     if (SDL_AtomicGet(&g->coverState) != CS_NONE)
       continue;
@@ -893,17 +1078,34 @@ static int work(void *unused) {
     struct stat st;
     if (!stat(none, &st))
       continue;
-    enum net r = sgdb_fetch(g);
-    if (r == NET_STOP)
-      break;
-    if (r == NET_FAIL) {
-      if (!SDL_AtomicGet(&stopWorker) && ++failed >= 3) {
-        fprintf(stderr, "Cover: SteamGridDB doesn't answer: the rest next start\n");
-        break;
-      }
-      continue;
+    enum net r = NET_NONE;
+    if (config) {
+      curlWithKey = true;
+      r = sgdb_fetch(g);
+      curlWithKey = false;
+      if (r == NET_STOP) { // the key refused (or no curl, which the next source finds too)
+        config = false;
+        r = NET_NONE;
+      } else if (r == NET_FAIL) {
+        if (!SDL_AtomicGet(&stopWorker) && ++failed >= 3) {
+          fprintf(stderr, "Cover: SteamGridDB doesn't answer: the rest next start\n");
+          config = false;
+        }
+        continue;
+      } else
+        failed = 0;
     }
-    failed = 0;
+    if (r == NET_NONE) {
+      r = lr_fetch(g);
+      if (r == NET_STOP)
+        break;
+      if (r == NET_FAIL) {
+        if (!SDL_AtomicGet(&stopWorker) && ++lrFailed >= 3)
+          break;
+        continue;
+      }
+      lrFailed = 0;
+    }
     if (r == NET_NONE) {
       FILE *f = fopen(none, "w");
       if (f)
@@ -917,6 +1119,11 @@ static int work(void *unused) {
       SDL_AtomicSet(&g->coverState, CS_READY);
     } else
       free(px);
+  }
+  for (int sys = 0; sys < 4; sys++) {
+    free(lrIndex[sys]);
+    lrIndex[sys] = NULL;
+    lrTried[sys] = false;
   }
   if (config)
     remove(curlConfig);
