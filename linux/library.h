@@ -47,6 +47,8 @@ void library_open(char *const *paths, int count, const char *dataDir, const char
 void library_keys(unsigned down);
 /* A pointer press or wheel notch on the canvas library_draw gets: (x, y) canvas pixels, click = a left press, wheel > 0 = up. */
 void library_pointer(int x, int y, bool click, int wheel);
+/* A right click (or control-click) at (x, y): the game under it is picked and its menu opens; elsewhere a menu closes. */
+void library_context(int x, int y);
 void library_tick(void);
 void library_draw(struct pd_canvas *c);
 int library_covers(struct lib_cover *out, int max);

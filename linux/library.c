@@ -81,6 +81,8 @@ static int page = P_GAMES, focus = F_GAMES, view = V_ALL, sortBy = S_NAME, railC
 static bool grid = true, quit, menuOpen, closeAsk;
 static int faceColors; // BUTTON COLORS: 0 the app's (red A, yellow B, blue X, green Y), 1 green A, red B, blue X, yellow Y
 static int selected, scroll, columns = 4, menuCursor, settingsCursor, settingsScroll, toolCursor;
+static bool settingsFollow = true; // the SETTINGS list keeps the cursor in view; off while the wheel scrolls it
+static int settingsTotal, settingsView, settingsBarY; // its height, the part shown and the bar's top, for clicks
 static const char *picked;
 static char notice[96];
 static unsigned noticeUntil;
@@ -91,7 +93,7 @@ static int contentY, contentH, contentX, contentW;
 
 /* What the last draw laid out under the pointer: the same rectangles it drew, so clicks need no second copy of the layout. */
 enum {
-  LIB_HIT_RAIL = 1, LIB_HIT_SORT, LIB_HIT_GRID, LIB_HIT_PILL, LIB_HIT_GAME, LIB_HIT_SETTING, LIB_HIT_TOOL, LIB_HIT_MENU, LIB_HIT_CLOSE,
+  LIB_HIT_SCROLLBAR = 100, LIB_HIT_RAIL = 1, LIB_HIT_SORT, LIB_HIT_GRID, LIB_HIT_PILL, LIB_HIT_GAME, LIB_HIT_SETTING, LIB_HIT_TOOL, LIB_HIT_MENU, LIB_HIT_CLOSE,
 };
 struct lib_hit {
   int x, y, w, h, action, arg;
@@ -1568,6 +1570,7 @@ static void move_games(unsigned down) {
 void library_keys(unsigned down) {
   if (!down)
     return;
+  settingsFollow = true;
   if (closeAsk) {
     if (down & (LIB_LEFT | LIB_RIGHT | LIB_UP | LIB_DOWN))
       menuCursor ^= 1;
@@ -2077,13 +2080,18 @@ static void draw_settings(struct pd_canvas *c) {
       cursorLine = lines;
     lines++;
   }
-  int viewH = contentH - 2 * f;
-  if (cursorLine * rowH < settingsScroll)
-    settingsScroll = cursorLine * rowH - rowH;
-  if ((cursorLine + 1) * rowH > settingsScroll + viewH)
-    settingsScroll = (cursorLine + 1) * rowH - viewH;
+  int viewH = contentH - 2 * f, total = lines * rowH, most = total > viewH ? total - viewH : 0;
+  if (settingsFollow) {
+    if (cursorLine * rowH < settingsScroll)
+      settingsScroll = cursorLine * rowH - rowH;
+    if ((cursorLine + 1) * rowH > settingsScroll + viewH)
+      settingsScroll = (cursorLine + 1) * rowH - viewH;
+  }
+  if (settingsScroll > most)
+    settingsScroll = most;
   if (settingsScroll < 0)
     settingsScroll = 0;
+  settingsTotal = total, settingsView = viewH;
   f = pd_list_box(c, contentX, contentY, contentW, contentH);
   pd_clip(c, contentX + f, contentY + f, contentW - 2 * f, contentH - 2 * f);
   int y = contentY + f - settingsScroll;
@@ -2107,6 +2115,17 @@ static void draw_settings(struct pd_canvas *c) {
     y += rowH;
   }
   pd_unclip(c);
+  // A scroll bar when the list is taller than its box: where you are, and a click on it goes there.
+  if (most > 0) {
+    int bx = contentX + contentW - f - 6, by = contentY + f + 2, bh = contentH - 2 * f - 4;
+    int th = bh * viewH / total, ty = by + (bh - th) * settingsScroll / most;
+    if (th < 12)
+      th = 12, ty = by + (bh - th) * settingsScroll / most;
+    pd_fill(c, bx, by, 4, bh, PD_DIVIDER);
+    pd_fill(c, bx, ty, 4, th, PD_VALUE);
+    settingsBarY = by;
+    hit_add(bx - 4, by, 12, bh, LIB_HIT_SCROLLBAR, bh);
+  }
 }
 
 static void draw_tools(struct pd_canvas *c) {
@@ -2265,6 +2284,20 @@ static void wheel_games(int dir) {
   focus = F_GAMES;
 }
 
+void library_context(int x, int y) {
+  if (closeAsk)
+    return;
+  int under = hit_under(x, y);
+  const struct lib_hit *h = under >= 0 ? &libHits[under] : NULL;
+  if (h && h->action == LIB_HIT_GAME && h->arg >= 0 && h->arg < shownCount && !menuOpen) {
+    selected = h->arg;
+    focus = F_GAMES;
+    menuOpen = true;
+    menuCursor = 0;
+  } else
+    menuOpen = false;
+}
+
 void library_pointer(int x, int y, bool click, int wheel) {
   int under = hit_under(x, y);
   const struct lib_hit *h = under >= 0 ? &libHits[under] : NULL;
@@ -2296,6 +2329,13 @@ void library_pointer(int x, int y, bool click, int wheel) {
   if (click) {
     if (!h)
       return;
+    if (h->action == LIB_HIT_SCROLLBAR) {
+      if (h->arg > 0 && settingsTotal > settingsView)
+        settingsScroll = (y - settingsBarY) * settingsTotal / h->arg - settingsView / 2;
+      settingsFollow = false;
+      focus = F_GAMES;
+      return;
+    }
     if (h->action == LIB_HIT_RAIL) {
       page = railCursor = h->arg;
       focus = F_GAMES;
@@ -2361,10 +2401,9 @@ void library_pointer(int x, int y, bool click, int wheel) {
     } else if (h->action == LIB_HIT_GAME) {
       for (int i = 0; i < steps; i++)
         wheel_games(dir);
-    } else if (h->action == LIB_HIT_SETTING) {
-      int n = settings_rows();
-      for (int i = 0; i < steps; i++)
-        settingsCursor = (settingsCursor + dir + n) % n;
+    } else if (h->action == LIB_HIT_SETTING || h->action == LIB_HIT_SCROLLBAR) {
+      settingsScroll += dir * steps * 8; // the list scrolls, a little per notch (a trackpad sends many); no wrapping
+      settingsFollow = false;
       focus = F_GAMES;
     } else if (h->action == LIB_HIT_TOOL) {
       for (int i = 0; i < steps; i++)
@@ -2374,9 +2413,8 @@ void library_pointer(int x, int y, bool click, int wheel) {
     return;
   }
   if (page == P_SETTINGS) {
-    int n = settings_rows();
-    for (int i = 0; i < steps; i++)
-      settingsCursor = (settingsCursor + dir + n) % n;
+    settingsScroll += dir * steps * 8;
+    settingsFollow = false;
     focus = F_GAMES;
   } else if (page == P_TOOLS) {
     for (int i = 0; i < steps; i++)
