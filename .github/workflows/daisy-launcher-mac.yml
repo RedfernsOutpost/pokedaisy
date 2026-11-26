@@ -1,0 +1,135 @@
+# Daisy Launcher for Mac: when PokeDaisy tags a new release on GitLab, merge it into mac-launcher, build the Mac app,
+# sign and notarize it, push the code, and leave a DRAFT release (mac-launcher-N) for a person to check and publish.
+# Published, it reaches users through the app's update check (Settings > VERSION > UPDATE).
+# Needs repository secrets (macos/README.md, "Automatic builds"): MAC_CERT_P12 (the Developer ID Application
+# certificate and key, base64), MAC_CERT_PASSWORD, NOTARY_APPLE_ID, NOTARY_TEAM_ID, NOTARY_PASSWORD (app-specific).
+# A merge that conflicts, or a build that fails, fails the run (GitHub emails about it) and changes nothing.
+name: Daisy Launcher for Mac
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "PokeDaisy tag to build (empty: the newest release)"
+        required: false
+      check_only:
+        description: "Build an unsigned copy of mac-launcher as it is (no merge, push or release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daisy-launcher-mac
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mac-launcher
+          fetch-depth: 0
+
+      - name: Find PokeDaisy's newest release
+        id: find
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ inputs.check_only }}" = "true" ]; then echo "build=check" >> "$GITHUB_OUTPUT"; exit 0; fi
+          git remote add gitlab https://gitlab.com/pokedaisy/pokedaisy.git
+          git fetch --quiet gitlab 'refs/tags/v*:refs/tags/v*'
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG=$(git tag -l 'v[0-9]*' | grep -viE -- '-(alpha|beta|rc)' | sort -V | tail -1)
+          echo "PokeDaisy's newest release: $TAG"
+          if git merge-base --is-ancestor "$TAG" HEAD; then
+            echo "Already in mac-launcher: nothing to do."; echo "build=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! git merge --no-edit "$TAG"; then
+            git merge --abort
+            echo "::error::PokeDaisy $TAG doesn't merge cleanly into mac-launcher: it needs a hand (macos/README.md)."
+            exit 1
+          fi
+          LAST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' |
+                 sed -n 's/^mac-launcher-\([0-9]*\)$/\1/p' | sort -n | tail -1)
+          N=$(( ${LAST:-0} + 1 ))
+          sed -i '' "s/^#define PD_MAC_RELEASE [0-9]*$/#define PD_MAC_RELEASE $N/" linux/library.c
+          grep -q "^#define PD_MAC_RELEASE $N$" linux/library.c
+          git commit -qam "Mac $N: PokeDaisy $TAG"
+          echo "Mac $N from PokeDaisy $TAG"
+          { echo "build=release"; echo "tag=$TAG"; echo "n=$N"; } >> "$GITHUB_OUTPUT"
+
+      - name: Tools
+        if: steps.find.outputs.build != 'no'
+        run: brew install sdl2 sdl3 cmake || true
+
+      - name: Signing keychain
+        if: steps.find.outputs.build == 'release'
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MAC_CERT_P12" ]; then echo "::error::The signing secrets aren't set (macos/README.md)."; exit 1; fi
+          KC="$RUNNER_TEMP/build.keychain"; KCPW=$(uuidgen)
+          echo "$MAC_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          ID=$(security find-identity -v -p codesigning "$KC" | grep -m1 '"Developer ID Application' | sed -E 's/.*"(.*)"/\1/')
+          [ -n "$ID" ] || { echo "::error::No Developer ID Application certificate in MAC_CERT_P12."; exit 1; }
+          echo "SIGN_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Build
+        if: steps.find.outputs.build != 'no'
+        run: zsh macos/build.sh
+
+      - name: Notarize
+        if: steps.find.outputs.build == 'release'
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          cd build/macos
+          ditto -c -k --keepParent "Daisy Launcher.app" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" --wait | tee "$RUNNER_TEMP/notary.txt"
+          grep -q "status: Accepted" "$RUNNER_TEMP/notary.txt"
+          xcrun stapler staple "Daisy Launcher.app"
+          spctl -a -vv -t exec "Daisy Launcher.app"
+
+      - name: Zip
+        if: steps.find.outputs.build != 'no'
+        run: |
+          mkdir -p out
+          ditto -c -k --keepParent "build/macos/Daisy Launcher.app" out/DaisyLauncher-Mac.zip
+          shasum -a 256 out/DaisyLauncher-Mac.zip
+
+      - name: Unsigned copy (check only)
+        if: steps.find.outputs.build == 'check'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DaisyLauncher-Mac-unsigned
+          path: out/DaisyLauncher-Mac.zip
+
+      - name: Push the code, then a draft release
+        if: steps.find.outputs.build == 'release'
+        run: |
+          N=${{ steps.find.outputs.n }}; TAG=${{ steps.find.outputs.tag }}
+          git push origin HEAD:mac-launcher   # the source first (GPL)
+          SHA=$(shasum -a 256 out/DaisyLauncher-Mac.zip | cut -d' ' -f1); COMMIT=$(git rev-parse --short HEAD)
+          sed -e "s/@N@/$N/g" -e "s/@TAG@/$TAG/g" -e "s/@COMMIT@/$COMMIT/g" -e "s/@SHA@/$SHA/g" macos/release-notes.md > "$RUNNER_TEMP/notes.md"
+          gh release create "mac-launcher-$N" out/DaisyLauncher-Mac.zip --draft --target "$(git rev-parse HEAD)" \
+            --title "Daisy Launcher for Mac $N (PokeDaisy $TAG)" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "::notice::Draft release mac-launcher-$N is ready: check it and publish it on GitHub."

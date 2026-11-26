@@ -49,3 +49,28 @@ its `roms/` folder and pick one from the game list. Saves, states and settings s
 - **Ekipad's Generic Gamepad route has a built-in mapping**, so that virtual controller works too (SDL has none for it).
 - **In the game list, a click picks a game and a second click plays it**, as in Finder. Keys and controllers are
   unchanged, and other platforms keep one click (a Steam Deck's touch screen arrives as clicks).
+
+## Updates
+
+Daisy Launcher looks for a newer `mac-launcher-N` release on start. Settings → VERSION → UPDATE downloads
+`DaisyLauncher-Mac.zip`, keeps it only if it is signed by the running app's own Developer ID team and passes Gatekeeper,
+moves the running app to the Trash and opens the new one in its place. A self-built (ad hoc) copy, one run from
+Downloads (translocated) or one in a folder it can't write opens the download page instead.
+
+## Automatic builds
+
+`.github/workflows/daisy-launcher-mac.yml` checks PokeDaisy's GitLab every day. When it has tagged a newer release, the
+workflow merges it into `mac-launcher`, bumps `PD_MAC_RELEASE`, builds, signs and notarizes the app, pushes the code and
+leaves a **draft** release `mac-launcher-N`. Publishing the draft on GitHub is what sends it to users. A merge that
+conflicts, or a failed build, fails the run (GitHub emails about it) without changing anything; then merge by hand.
+Run it from the Actions tab with **check_only** to build an unsigned copy of the branch as it is.
+
+It needs these repository secrets (Settings → Secrets and variables → Actions):
+
+| Secret | What |
+|---|---|
+| `MAC_CERT_P12` | The Developer ID Application certificate with its private key, exported from Keychain Access as a .p12, then `base64 -i cert.p12 \| pbcopy` |
+| `MAC_CERT_PASSWORD` | The password given to that .p12 when exporting it |
+| `NOTARY_APPLE_ID` | The Apple Account email of the developer account |
+| `NOTARY_TEAM_ID` | The team ID (in the certificate's name, in brackets) |
+| `NOTARY_PASSWORD` | An app-specific password from account.apple.com |
