@@ -915,7 +915,7 @@ static enum net lr_get(const char *url, char **body) {
 #ifdef __APPLE__
 /* PokeDaisy for Mac's own releases (RedfernsOutpost/pokedaisy, tags mac-launcher-N): this build is N = PD_MAC_RELEASE.
  * Looked up once a start, in the background; a newer one is said along the bottom and SETTINGS > VERSION opens it. */
-#define PD_MAC_RELEASE 2
+#define PD_MAC_RELEASE 3
 static const char *lr_json(const char *from, const char *key, char *out, size_t len);
 static int run_wait(const char *const *argv);
 static void say(const char *text);
