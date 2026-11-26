@@ -63,7 +63,8 @@ Downloads (translocated) or one in a folder it can't write opens the download pa
 workflow merges it into `mac-launcher`, bumps `PD_MAC_RELEASE`, builds, signs and notarizes the app, pushes the code and
 leaves a **draft** release `mac-launcher-N`. Publishing the draft on GitHub is what sends it to users. A merge that
 conflicts, or a failed build, fails the run (GitHub emails about it) without changing anything; then merge by hand.
-Run it from the Actions tab with **check_only** to build an unsigned copy of the branch as it is.
+Run it from the Actions tab with **check_only** to build an unsigned copy of the branch as it is, or **test_signing**
+to build, sign and notarize it (a check of the secrets); neither pushes or releases anything.
 
 It needs these repository secrets (Settings → Secrets and variables → Actions):
 

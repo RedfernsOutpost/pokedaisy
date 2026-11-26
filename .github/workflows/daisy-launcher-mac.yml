@@ -18,6 +18,10 @@ on:
         description: "Build an unsigned copy of mac-launcher as it is (no merge, push or release)"
         type: boolean
         default: false
+      test_signing:
+        description: "Build, sign and notarize mac-launcher as it is, to test the secrets (no merge, push or release)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -43,6 +47,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ inputs.test_signing }}" = "true" ]; then echo "build=signtest" >> "$GITHUB_OUTPUT"; exit 0; fi
           if [ "${{ inputs.check_only }}" = "true" ]; then echo "build=check" >> "$GITHUB_OUTPUT"; exit 0; fi
           git remote add gitlab https://gitlab.com/pokedaisy/pokedaisy.git
           git fetch --quiet gitlab 'refs/tags/v*:refs/tags/v*'
@@ -71,7 +76,7 @@ jobs:
         run: brew install sdl2 sdl3 cmake || true
 
       - name: Signing keychain
-        if: steps.find.outputs.build == 'release'
+        if: steps.find.outputs.build == 'release' || steps.find.outputs.build == 'signtest'
         env:
           MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
@@ -95,7 +100,7 @@ jobs:
         run: zsh macos/build.sh
 
       - name: Notarize
-        if: steps.find.outputs.build == 'release'
+        if: steps.find.outputs.build == 'release' || steps.find.outputs.build == 'signtest'
         env:
           NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
           NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
@@ -116,11 +121,11 @@ jobs:
           ditto -c -k --keepParent "build/macos/Daisy Launcher.app" out/DaisyLauncher-Mac.zip
           shasum -a 256 out/DaisyLauncher-Mac.zip
 
-      - name: Unsigned copy (check only)
-        if: steps.find.outputs.build == 'check'
+      - name: The test build (check only / signing test)
+        if: steps.find.outputs.build == 'check' || steps.find.outputs.build == 'signtest'
         uses: actions/upload-artifact@v4
         with:
-          name: DaisyLauncher-Mac-unsigned
+          name: DaisyLauncher-Mac-${{ steps.find.outputs.build }}
           path: out/DaisyLauncher-Mac.zip
 
       - name: Push the code, then a draft release
