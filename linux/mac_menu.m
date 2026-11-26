@@ -120,3 +120,66 @@ void mac_menu_install(void (*add_game)(const char *path), const int *codes) {
   menu_insert(bar, game, 3);
   menu_insert(bar, help, bar.numberOfItems);
 }
+
+// ---- the updater's Mac parts (mac_menu.h) ----
+#import <Security/Security.h>
+
+bool mac_bundle_path(char *out, size_t len) {
+  NSString *path = NSBundle.mainBundle.bundlePath;
+  if (!path || ![path.pathExtension isEqualToString:@"app"])
+    return false;
+  return snprintf(out, len, "%s", path.fileSystemRepresentation) < (int)len;
+}
+
+static NSString *self_team(void) {
+  SecCodeRef me = NULL;
+  CFDictionaryRef info = NULL;
+  NSString *team = nil;
+  if (SecCodeCopySelf(kSecCSDefaultFlags, &me) == errSecSuccess) {
+    SecStaticCodeRef still = NULL;
+    if (SecCodeCopyStaticCode(me, kSecCSDefaultFlags, &still) == errSecSuccess) {
+      if (SecCodeCopySigningInformation(still, kSecCSSigningInformation, &info) == errSecSuccess && info) {
+        id t = ((__bridge NSDictionary *)info)[(__bridge NSString *)kSecCodeInfoTeamIdentifier];
+        if ([t isKindOfClass:NSString.class] && [t length])
+          team = [t copy];
+        CFRelease(info);
+      }
+      CFRelease(still);
+    }
+    CFRelease(me);
+  }
+  return team;
+}
+
+bool mac_same_signer(const char *app) {
+  NSString *team = self_team();
+  if (!team)
+    return false;
+  NSString *req = [NSString stringWithFormat:@"anchor apple generic and certificate leaf[subject.OU] = \"%@\"", team];
+  SecRequirementRef requirement = NULL;
+  SecStaticCodeRef code = NULL;
+  bool ok = false;
+  NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:app]];
+  if (SecRequirementCreateWithString((__bridge CFStringRef)req, kSecCSDefaultFlags, &requirement) == errSecSuccess &&
+      SecStaticCodeCreateWithPath((__bridge CFURLRef)url, kSecCSDefaultFlags, &code) == errSecSuccess)
+    ok = SecStaticCodeCheckValidity(code, kSecCSCheckAllArchitectures | kSecCSStrictValidate | kSecCSCheckNestedCode,
+                                    requirement) == errSecSuccess;
+  if (code)
+    CFRelease(code);
+  if (requirement)
+    CFRelease(requirement);
+  return ok;
+}
+
+bool mac_swap_app(const char *current, const char *fresh) {
+  NSFileManager *fm = NSFileManager.defaultManager;
+  NSURL *cur = [NSURL fileURLWithPath:[NSString stringWithUTF8String:current]];
+  NSURL *neu = [NSURL fileURLWithPath:[NSString stringWithUTF8String:fresh]];
+  NSURL *trashed = nil;
+  if (![fm trashItemAtURL:cur resultingItemURL:&trashed error:nil] || !trashed)
+    return false;
+  if ([fm moveItemAtURL:neu toURL:cur error:nil])
+    return true;
+  [fm moveItemAtURL:trashed toURL:cur error:nil]; // back where it was
+  return false;
+}

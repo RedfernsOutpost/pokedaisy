@@ -33,6 +33,9 @@
 #include "pd_settings.h"
 #include "pd_sha1.h"
 #include "pd_style.h"
+#ifdef __APPLE__
+#include "mac_menu.h"
+#endif
 
 /* The 3DS library's art (pd_library_draw.c): the rail's icons and the flower at 24 px. */
 extern const struct pd_art LIB_ICON_GAMES, LIB_ICON_EDIT, LIB_ICON_TRADE, LIB_ICON_SETTINGS;
@@ -926,15 +929,123 @@ static int run_wait(const char *const *argv);
 static void say(const char *text);
 static SDL_atomic_t updateFound; // the newer release's N, 0 = none (yet)
 static bool updateSaid;
+#define PD_MAC_RELEASES "https://github.com/RedfernsOutpost/pokedaisy/releases/"
+#define PD_MAC_ZIP "DaisyLauncher-Mac.zip"
+static char updateUrl[512]; // the newer release's zip (set before updateFound)
 static int update_check(void *unused) {
   (void)unused;
-  char *body = NULL, tag[64];
+  char *body = NULL, tag[64], url[512];
   int n = 0;
   if (lr_get("https://api.github.com/repos/RedfernsOutpost/pokedaisy/releases/latest", &body) == NET_OK &&
-      lr_json(body, "tag_name", tag, sizeof tag) && sscanf(tag, "mac-launcher-%d", &n) == 1 && n > PD_MAC_RELEASE)
+      lr_json(body, "tag_name", tag, sizeof tag) && sscanf(tag, "mac-launcher-%d", &n) == 1 && n > PD_MAC_RELEASE) {
+    for (const char *at = body; (at = lr_json(at, "browser_download_url", url, sizeof url));)
+      if (!strncmp(url, PD_MAC_RELEASES "download/", strlen(PD_MAC_RELEASES "download/")) &&
+          strlen(url) > strlen("/" PD_MAC_ZIP) && !strcmp(url + strlen(url) - strlen("/" PD_MAC_ZIP), "/" PD_MAC_ZIP)) {
+        snprintf(updateUrl, sizeof updateUrl, "%s", url);
+        break;
+      }
     SDL_AtomicSet(&updateFound, n);
+  }
   free(body);
   return 0;
+}
+
+/* SETTINGS > VERSION with a newer release: download its zip beside the app, keep it only if it's signed by this app's
+ * own Developer ID team and passes Gatekeeper (notarized), then trash this app, put the new one in its place and open
+ * it once this one has quit. Anything it can't do (an ad hoc build, a translocated or read-only app, a failed check)
+ * opens the download page instead. */
+static SDL_atomic_t updateStage; // 0 idle, 1 working, 2 ready to swap, -1 failed
+static char updateDir[PATH_MAX], updateApp[PATH_MAX], updateHere[PATH_MAX];
+static void update_page(void) {
+  const char *argv[] = {"open", PD_MAC_RELEASES "latest", NULL};
+  run_wait(argv);
+}
+static void update_clean(void) {
+  if (updateDir[0] && strstr(updateDir, "/.Daisy Launcher update ")) {
+    const char *argv[] = {"rm", "-rf", updateDir, NULL};
+    run_wait(argv);
+  }
+  updateDir[0] = 0;
+}
+static int update_download(void *unused) {
+  (void)unused;
+  char zip[PATH_MAX];
+  snprintf(zip, sizeof zip, "%s/" PD_MAC_ZIP, updateDir);
+  snprintf(updateApp, sizeof updateApp, "%s/Daisy Launcher.app", updateDir);
+  const char *get[] = {"curl", "-fsSL", "--connect-timeout", "15", "--max-time", "900", "-o", zip, updateUrl, NULL};
+  const char *unzip[] = {"ditto", "-x", "-k", zip, updateDir, NULL};
+  const char *gatekeeper[] = {"spctl", "-a", "-t", "exec", updateApp, NULL};
+  bool ok = run_wait(get) == 0 && run_wait(unzip) == 0 && mac_same_signer(updateApp) && run_wait(gatekeeper) == 0;
+  SDL_AtomicSet(&updateStage, ok ? 2 : -1);
+  return 0;
+}
+static void update_start(void) {
+  if (SDL_AtomicGet(&updateStage))
+    return;
+  char parent[PATH_MAX];
+  bool can = updateUrl[0] && mac_bundle_path(updateHere, sizeof updateHere) && !strstr(updateHere, "/AppTranslocation/") &&
+             mac_same_signer(updateHere);
+  if (can) {
+    snprintf(parent, sizeof parent, "%s", updateHere);
+    char *slash = strrchr(parent, '/');
+    can = slash && slash != parent;
+    if (can) {
+      *slash = 0;
+      can = access(parent, W_OK) == 0;
+    }
+  }
+  if (can) {
+    snprintf(updateDir, sizeof updateDir, "%s/.Daisy Launcher update %d", parent, (int)getpid());
+    can = pd_mkdir(updateDir) == 0;
+  }
+  SDL_Thread *t = can ? SDL_CreateThread(update_download, "update", NULL) : NULL;
+  if (!t) {
+    update_clean();
+    update_page();
+    return;
+  }
+  SDL_DetachThread(t);
+  SDL_AtomicSet(&updateStage, 1);
+  char said[96];
+  snprintf(said, sizeof said, "Downloading Daisy Launcher %d...", SDL_AtomicGet(&updateFound));
+  say(said);
+  noticeUntil = SDL_GetTicks() + 600000; // up until it's done
+}
+/* From library_tick: a finished download swaps the apps and quits; the new one opens after this one has gone.
+ * POCKET_UPDATE_TEST="N:/path/to/DaisyLauncher-Mac.zip" (tests): that zip as release N, installed at once. */
+static void update_follow(void) {
+  static bool tested;
+  const char *test = tested ? NULL : getenv("POCKET_UPDATE_TEST");
+  tested = true;
+  int testN = 0;
+  char testZip[400];
+  if (test && sscanf(test, "%d:%399[^\n]", &testN, testZip) == 2 && testN > 0) {
+    snprintf(updateUrl, sizeof updateUrl, "file://%s", testZip);
+    SDL_AtomicSet(&updateFound, testN);
+    update_start();
+  }
+  int stage = SDL_AtomicGet(&updateStage);
+  if (stage == 2 && mac_swap_app(updateHere, updateApp)) {
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", (int)getpid());
+    const char *script = "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; open \"$2\"; "
+                         "case \"$3\" in */.Daisy\\ Launcher\\ update\\ *) rm -rf \"$3\";; esac";
+    const char *argv[] = {"/bin/sh", "-c", script, "daisy-update", pid, updateHere, updateDir, NULL};
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    pid_t child;
+    posix_spawn(&child, "/bin/sh", NULL, &attr, (char *const *)argv, environ);
+    posix_spawnattr_destroy(&attr);
+    say("Updated: Daisy Launcher is restarting");
+    quit = true;
+    SDL_AtomicSet(&updateStage, 0);
+  } else if (stage == 2 || stage == -1) {
+    update_clean();
+    say("The update didn't work: opening the download page");
+    update_page();
+    SDL_AtomicSet(&updateStage, 0);
+  }
 }
 #endif
 
@@ -1394,11 +1505,12 @@ void library_tick(void) {
 #ifdef __APPLE__
   if (SDL_AtomicGet(&updateFound) && !updateSaid) {
     char said[96];
-    snprintf(said, sizeof said, "Daisy Launcher %d is out: SETTINGS > VERSION to get it", SDL_AtomicGet(&updateFound));
+    snprintf(said, sizeof said, "Daisy Launcher %d is out: SETTINGS > VERSION to update", SDL_AtomicGet(&updateFound));
     say(said);
     noticeUntil = SDL_GetTicks() + 6000;
     updateSaid = true;
   }
+  update_follow();
 #endif
   bool renamed = false;
   for (int i = 0; i < gameCount; i++) {
@@ -1494,8 +1606,10 @@ static void setting_label(int row, char *label, int llen, char *value, int vlen)
   } else {
     snprintf(label, (size_t)llen, "VERSION");
 #ifdef __APPLE__
-    if (SDL_AtomicGet(&updateFound))
-      snprintf(value, (size_t)vlen, "MAC %d: GET MAC %d", PD_MAC_RELEASE, SDL_AtomicGet(&updateFound));
+    if (SDL_AtomicGet(&updateStage) == 1)
+      snprintf(value, (size_t)vlen, "DOWNLOADING MAC %d...", SDL_AtomicGet(&updateFound));
+    else if (SDL_AtomicGet(&updateFound))
+      snprintf(value, (size_t)vlen, "MAC %d: UPDATE TO MAC %d", PD_MAC_RELEASE, SDL_AtomicGet(&updateFound));
     else
       snprintf(value, (size_t)vlen, "%s (MAC %d)", host && host->version ? host->version : "", PD_MAC_RELEASE);
 #else
@@ -1530,10 +1644,8 @@ static void setting_step(int row, int dir) {
     state_save();
   } else if (row == SET_OWN + host_rows() + 2) {
 #ifdef __APPLE__
-    if (SDL_AtomicGet(&updateFound)) { // the download page
-      const char *argv[] = {"open", "https://github.com/RedfernsOutpost/pokedaisy/releases/latest", NULL};
-      run_wait(argv);
-    }
+    if (SDL_AtomicGet(&updateFound)) // download and install it (or the download page)
+      update_start();
 #endif
   } else if (row == SET_OWN + host_rows() + 1) {
     int shown = 0;
