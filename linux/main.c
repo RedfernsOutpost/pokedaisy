@@ -2107,8 +2107,13 @@ static void thumb_write(const char *state) {
   SDL_RenderCopy(renderer, frameTexture, &src, &dst);
   char bmp[PATH_MAX * 2 + 8];
   snprintf(bmp, sizeof bmp, "%s.bmp", state);
-  if (!SDL_RenderReadPixels(renderer, &dst, SDL_PIXELFORMAT_ARGB8888, img->pixels, img->pitch))
+  if (!SDL_RenderReadPixels(renderer, &dst, SDL_PIXELFORMAT_ARGB8888, img->pixels, img->pitch)) {
+    // Opaque: the DS core's frames are XRGB with the X byte 0, which read back as a fully clear picture.
+    for (int y = 0; y < th; y++)
+      for (int x = 0; x < tw; x++)
+        ((uint32_t *)((uint8_t *)img->pixels + y * img->pitch))[x] |= 0xFF000000u;
     SDL_SaveBMP(img, bmp);
+  }
   SDL_FreeSurface(img);
 }
 static void slot_thumb_load(const char *state) {
@@ -2121,6 +2126,8 @@ static void slot_thumb_load(const char *state) {
   if (!img)
     return;
   slotThumb = SDL_CreateTextureFromSurface(renderer, img);
+  if (slotThumb) // a picture saved before it was made opaque still shows
+    SDL_SetTextureBlendMode(slotThumb, SDL_BLENDMODE_NONE);
   slotThumbW = img->w;
   slotThumbH = img->h;
   SDL_FreeSurface(img);
@@ -2458,6 +2465,28 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
     }
     if ((hkFired & (1u << HK_REWIND)) && !hostSet.rewind)
       notice("REWIND is off: turn it on in the menu");
+    // The mouse in the menu: a click on a row picks it as A would, a right click is B. (Taken each frame, so a click
+    // in the game, the core's touch, isn't kept for the menu.)
+    const bool click = libraryClick, rightClick = libraryRightClick;
+    libraryClick = libraryRightClick = false;
+    if (menuOpen && capturing < 0 && kbCapture < 0 && (click || rightClick)) {
+      struct pd_menu *shown = confirming ? &confirmMenu : slotPage ? &slotMenu : hkPage ? &hkMenu : kbPage ? &kbMenu : &menu;
+      int ow = W, oh = H;
+      SDL_GetRendererOutputSize(renderer, &ow, &oh);
+      int sc = overlay.w > 0 && overlay.h > 0 ? (ow / overlay.w < oh / overlay.h ? ow / overlay.w : oh / overlay.h) : 1;
+      sc = sc < 1 ? 1 : sc;
+      const int x = (mouseWindowX - (ow - overlay.w * sc) / 2) / sc, y = (mouseWindowY - (oh - overlay.h * sc) / 2) / sc;
+      if (rightClick)
+        pressed |= 1u << B;
+      else {
+        pd_menu_touch(shown, x, y, true);
+        const int row = pd_menu_touch(shown, x, y, false);
+        if (row >= 0) {
+          shown->selected = row;
+          pressed |= 1u << A;
+        }
+      }
+    }
     const bool menuFrame = menuOpen; // the frame that closes the menu is still the menu's
     if (menuOpen && capturing >= 0) {
       // The next assignable button is the hotkey (taken from any other action that had it); B cancels, SELECT = OFF.
