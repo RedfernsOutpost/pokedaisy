@@ -5,6 +5,11 @@ third_party/patches/apply_dsperate_macos_patch.cmake when building on Apple only
   Mach-O's __TEXT,__const and their symbols carry the leading underscore C names have there.
 - gpu/render3d.cpp: Apple clang refuses reinterpret_cast from const void* to a function pointer (const_cast first).
 - gpu/kernels_neon.cpp: Apple's vst1_u32 is a macro, so a brace-initialised vector argument needs parentheses.
+- cpu/jit (the recompiler, on since Mac 3): the code arena is MAP_JIT and every write to it sits in a JitWriteScope
+  (pthread_jit_write_protect_np: a thread sees MAP_JIT memory writable or executable, never both); dispatch loads the
+  arena base as a constant instead of keeping it in x18, which macOS reserves; the fastmem fault handler reads Darwin's
+  ucontext. mem/fastmem.cpp: fastmem stays off (no memfd; its views have no macOS backing), so the recompiler takes its
+  page-table path.
 
 diff --git a/src/core/cheat/analog_db.cpp b/src/core/cheat/analog_db.cpp
 index a3681b9..ce3027e 100644
@@ -35,6 +40,196 @@ index a3681b9..ce3027e 100644
    "\t.previous\n");
  extern "C" const ds::u8 dsperate_analog_db_begin[], dsperate_analog_db_end[];
  
+diff --git a/src/core/cpu/jit/a64/convention.h b/src/core/cpu/jit/a64/convention.h
+index 2518664..b737d54 100644
+--- a/src/core/cpu/jit/a64/convention.h
++++ b/src/core/cpu/jit/a64/convention.h
+@@ -30,7 +30,16 @@ namespace ds::jit {
+ //                     arguments (instruction, key, ...) through it
+ //
+ // Guest NZCV live in the host NZCV; the rest of CPSR lives in memory.
+-constexpr u32 R_BUDGET = 8, R_PT = 14, R_TIM = 15, R_ARENA = 18, R_CTX = 29, R_LR = 30;
++#if defined(__APPLE__)
++// macOS reserves x18 (the kernel may zero it at any time), so nothing keeps the arena base in a register: dispatch
++// loads it into x17 (a stub temp) as a constant, which it is (the arena is mapped once and never moves).
++constexpr u32 R_ARENA = 17;
++constexpr bool ARENA_IN_REG = false;
++#else
++constexpr u32 R_ARENA = 18;
++constexpr bool ARENA_IN_REG = true;
++#endif
++constexpr u32 R_BUDGET = 8, R_PT = 14, R_TIM = 15, R_CTX = 29, R_LR = 30;
+ constexpr u32 SCRATCH0 = 0, SCRATCH1 = 1, SCRATCH2 = 2, SCRATCH3 = 3, SCRATCH4 = 4, SCRATCH5 = 5, SCRATCH6 = 6, SCRATCH7 = 7;
+ constexpr u32 R_FN = 16;        // function address for the call stubs
+ 
+diff --git a/src/core/cpu/jit/a64/stubs.cpp b/src/core/cpu/jit/a64/stubs.cpp
+index 9d95b87..512cb4f 100644
+--- a/src/core/cpu/jit/a64/stubs.cpp
++++ b/src/core/cpu/jit/a64/stubs.cpp
+@@ -44,7 +44,7 @@ void emit_load_caller_saved_guest(Emitter& e) {
+   e.ldr_x(17, R_CTX, OFF_JIT);
+   e.ldr_x(R_PT, 17, OFF_JC_PT);
+   e.ldr_x(R_TIM, 17, OFF_JC_TIM);
+-  e.ldr_x(R_ARENA, 17, OFF_JC_ARENA);
++  if (ARENA_IN_REG) e.ldr_x(R_ARENA, 17, OFF_JC_ARENA);
+ }
+ void emit_save_flags(Emitter& e, u32 t0, u32 t1) {
+   e.mrs_nzcv(t0);
+@@ -265,6 +265,7 @@ void emit_stubs(Runtime& rt) {
+ 
+     // dispatch: w0 = key. LUT entry = (native offset << 32) | key, at R_ARENA.
+     jc.dispatch = e.cur();
++    if (!ARENA_IN_REG) e.mov_imm64(R_ARENA, reinterpret_cast<u64>(rt.arena));
+     e.ubfx(2, 0, 1, LUT_BITS);
+     if (c != 0) {
+       const bool ok = e.orr_imm(2, 2, static_cast<u32>(LUT_STRIDE / 8));
+diff --git a/src/core/cpu/jit/jit_internal.h b/src/core/cpu/jit/jit_internal.h
+index 1cfc911..1774db3 100644
+--- a/src/core/cpu/jit/jit_internal.h
++++ b/src/core/cpu/jit/jit_internal.h
+@@ -7,6 +7,9 @@
+ #include "core/cpu/cpu.h"
+ 
+ #include <cstddef>
++#if defined(__APPLE__)
++#include <pthread.h>
++#endif
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <vector>
+@@ -270,4 +273,20 @@ void        jit_h_st32(CpuContext* cpu, u32 addr, u32 v);
+ 
+ inline void sync_icache(u8* start, size_t len) { __builtin___clear_cache(reinterpret_cast<char*>(start), reinterpret_cast<char*>(start + len)); }
+ 
++// macOS on Apple Silicon: the arena is MAP_JIT memory, which a thread sees either writable or executable, never both
++// (pthread_jit_write_protect_np). Every write to the arena (code, patches, the LUTs at its front) sits in one of these;
++// they nest, and the outermost puts the thread back to executable, so a helper called from translated code returns
++// to code it can run. Elsewhere the arena is plain RWX and this is nothing.
++#if defined(__APPLE__) && defined(__aarch64__)
++struct JitWriteScope {
++  static inline thread_local int depth = 0;
++  JitWriteScope() { if (depth++ == 0) pthread_jit_write_protect_np(0); }
++  ~JitWriteScope() { if (--depth == 0) pthread_jit_write_protect_np(1); }
++  JitWriteScope(const JitWriteScope&) = delete;
++  JitWriteScope& operator=(const JitWriteScope&) = delete;
++};
++#else
++struct JitWriteScope {};
++#endif
++
+ } // namespace ds::jit
+diff --git a/src/core/cpu/jit/runtime.cpp b/src/core/cpu/jit/runtime.cpp
+index 21df031..820e477 100644
+--- a/src/core/cpu/jit/runtime.cpp
++++ b/src/core/cpu/jit/runtime.cpp
+@@ -26,7 +26,11 @@
+ #include <cstdlib>
+ #include <sys/mman.h>
+ #include <csignal>
++#if defined(__APPLE__)
++#include <sys/ucontext.h>   // <ucontext.h> wants _XOPEN_SOURCE; the fault handler is never installed here (no views)
++#else
+ #include <ucontext.h>
++#endif
+ #include <iterator>
+ #include <algorithm>
+ #include <vector>
+@@ -137,6 +141,7 @@ constexpr size_t PARKED_PER_KEY = 4;
+ 
+ void kill_block(JitCpu& jc, Block* b) {
+   if (b->dead) return;
++  JitWriteScope w;
+   b->dead = true;
+   // Linked callers now land in the dispatcher, which revives or retranslates.
+   std::memcpy(b->entry_words, b->entry, backend::ENTRY_PATCH);
+@@ -167,6 +172,7 @@ JitCpu& jc_of(Block* b) { return g_rt.cpus[b->owner]; }
+ void reset_arena() {
+   if (churn::on()) ++churn::resets;
+   Runtime& r = g_rt;
++  JitWriteScope w;
+   for (JitCpu& jc : r.cpus) {
+     for (Block* b : jc.all_blocks) if (!b->pooled) delete b;
+     jc.all_blocks.clear();
+@@ -220,6 +226,7 @@ Runtime& rt() { return g_rt; }
+ 
+ void lut_insert(JitCpu& jc, Block* b) {
+   const u32 idx = (b->key >> 1) & (LUT_SIZE - 1);
++  JitWriteScope w;
+   jc.lut[idx] = (static_cast<u64>(b->entry - g_rt.arena) << 32) | b->key;
+ }
+ 
+@@ -339,6 +346,7 @@ static Block* revive(JitCpu& jc, u32 key) {
+     if (!same) continue;
+     v.erase(v.begin() + static_cast<std::ptrdiff_t>(k));
+     if (v.empty()) jc.parked.erase(it);
++    JitWriteScope w;
+     std::memcpy(b->entry, b->entry_words, backend::ENTRY_PATCH);
+     sync_icache(b->entry, backend::ENTRY_PATCH);
+     b->dead = false;
+@@ -418,6 +426,7 @@ Block* translate(JitCpu& jc, u32 key) {
+   b->pooled = true;
+   u32 size = 0;
+   r.fm_new.clear();
++  JitWriteScope w;
+   {
+     DS_PROF(JIT_TX_GEN);
+     if (!backend::translate_block(jc, key, r.arena + r.pos, BLOCK_MARGIN, *b, size)) { r.block_pool.pop_back(); r.fm_new.clear(); return nullptr; }
+@@ -580,6 +589,7 @@ extern "C" const void* jit_h_link(CpuContext* cpu, u32 key, u8* patch_site) {
+   const u8* native = find_native(jc, key);
+   if (g_rt.debug) std::fprintf(stderr, "[jit] link %08x -> %p at %p (budget %d)\n", key, static_cast<const void*>(native), static_cast<void*>(patch_site), cpu->hot.cycle_budget);
+   if (!native) { cpu->hot.regs[15] = key_r15(key); return g_rt.flush_exit; }
++  JitWriteScope w;
+   backend::patch_link(patch_site, native);
+   sync_icache(patch_site, 4);
+   return native;
+@@ -667,7 +677,9 @@ static void fm_fault(int sig, siginfo_t* si, void* uctx) {
+   Runtime& r = g_rt;
+   uintptr_t pc = 0;
+   ucontext_t* uc = static_cast<ucontext_t*>(uctx);
+-#if defined(__aarch64__)
++#if defined(__APPLE__) && defined(__aarch64__)
++  pc = static_cast<uintptr_t>(uc->uc_mcontext->__ss.__pc);
++#elif defined(__aarch64__)
+   pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+ #elif defined(__arm__)
+   pc = static_cast<uintptr_t>(uc->uc_mcontext.arm_pc);
+@@ -710,11 +722,13 @@ static void fm_fault(int sig, siginfo_t* si, void* uctx) {
+   }
+   u8* const patch = const_cast<u8*>(block) + site->patch;
+   const u8* const resume = block + site->resume;
+-  backend::patch_link(patch, resume);
++  { JitWriteScope w; backend::patch_link(patch, resume); }
+   sync_icache(patch, 4);
+   if (r.fm_ring_n < std::size(r.fm_ring)) r.fm_ring[r.fm_ring_n++] = site->guest;
+   ++r.fm_faults;
+-#if defined(__aarch64__)
++#if defined(__APPLE__) && defined(__aarch64__)
++  uc->uc_mcontext->__ss.__pc = reinterpret_cast<u64>(resume);
++#elif defined(__aarch64__)
+   uc->uc_mcontext.pc = reinterpret_cast<u64>(resume);
+ #elif defined(__arm__)
+   uc->uc_mcontext.arm_pc = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(resume));
+@@ -735,6 +749,7 @@ static void install_fault_handler() {
+ 
+ bool attach(NDS& nds, bool arm9, bool arm7) {
+   Runtime& r = g_rt;
++  JitWriteScope w;
+   // The stubs bake in the timing model (refill); a change between attaches
+   // (tests run both) drops every block and emits them again.
+   if (r.arena && r.stubs_fast != g_fast_timing) {
+@@ -743,7 +758,12 @@ bool attach(NDS& nds, bool arm9, bool arm7) {
+     r.stubs_fast = g_fast_timing;
+   }
+   if (!r.arena) {
++#if defined(__APPLE__)
++    // Apple Silicon maps writable code only as MAP_JIT (W^X per thread: JitWriteScope).
++    void* p = mmap(nullptr, ARENA_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
++#else
+     void* p = mmap(nullptr, ARENA_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++#endif
+     if (p == MAP_FAILED) { std::fprintf(stderr, "jit: cannot map code arena\n"); return false; }
+     r.arena = static_cast<u8*>(p);
+     r.cap = ARENA_BYTES;
 diff --git a/src/core/crypto/aes.c b/src/core/crypto/aes.c
 index 0b380eb..c0e7ecf 100644
 --- a/src/core/crypto/aes.c
@@ -200,3 +395,16 @@ index 86496da..3f81708 100644
    DSPERATE_FONT_BLOB("dsperate_dsi_font", "TWLFontTable.dat")
    DSPERATE_FONT_BLOB("dsperate_dsi_font_cn", "TWLFontTable-cn.dat")
    DSPERATE_FONT_BLOB("dsperate_dsi_font_kr", "TWLFontTable-kr.dat")
+diff --git a/src/core/mem/fastmem.cpp b/src/core/mem/fastmem.cpp
+index 94d354c..18c27e1 100644
+--- a/src/core/mem/fastmem.cpp
++++ b/src/core/mem/fastmem.cpp
+@@ -21,7 +21,7 @@ namespace ds::mem {
+ // Default on where the JIT reads views (AArch64/ARMv7 with JIT); DS_FASTMEM
+ // overrides.
+ bool fastmem_requested() {
+-#if (defined(__aarch64__) || defined(__arm__)) && DSPERATE_JIT
++#if (defined(__aarch64__) || defined(__arm__)) && DSPERATE_JIT && !defined(__APPLE__)   // macOS: no views (below)
+   constexpr bool kDefault = true;
+ #else
+   constexpr bool kDefault = false;

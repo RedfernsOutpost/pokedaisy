@@ -773,7 +773,8 @@ static struct {
   bool resume;    // CONTINUE ON OPEN: a game opens where it was left (its state at the last quit)
   bool pauseAway; // PAUSE IN BACKGROUND: the game waits while another window has the focus
   char savesFolder[PATH_MAX]; // SAVES FOLDER: "" = DATA/saves, else that folder (iCloud Drive, Google Drive, ...)
-} hostSet = {0, false, false, false, {R2, L2, -1, -1}, {R2, L2, -1, -1}, SELECT, false, 0, 0, 0, 0, 0, true, true, ""};
+  bool dsSafe; // DS ENGINE: SAFE runs DSperate's interpreter (dsperate_jit disabled), FAST its recompiler
+} hostSet = {0, false, false, false, {R2, L2, -1, -1}, {R2, L2, -1, -1}, SELECT, false, 0, 0, 0, 0, 0, true, true, "", false};
 static char hostIni[PATH_MAX];
 /* A DS game's L2 / R2 are its companion and screen buttons: with no modifier held for them, its FAST FORWARD and REWIND
  * go back to the stick clicks (R3 / L3), and come back to R2 / L2 when a modifier is picked again. */
@@ -818,6 +819,8 @@ static void host_load(void) {
       hostSet.resume = v != 0;
     if (sscanf(line, "pause_away=%d", &v) == 1)
       hostSet.pauseAway = v != 0;
+    if (sscanf(line, "ds_safe=%d", &v) == 1)
+      hostSet.dsSafe = v != 0;
     if (!strncmp(line, "saves_dir=", 10)) {
       snprintf(hostSet.savesFolder, sizeof hostSet.savesFolder, "%s", line + 10);
       hostSet.savesFolder[strcspn(hostSet.savesFolder, "\r\n")] = 0;
@@ -864,7 +867,8 @@ static void host_write(void) {
     return;
   fprintf(f, "ff_speed=%d\nrewind=%d\nlcd=%d\nswap_ab=%d\n", hostSet.ffSpeed, hostSet.rewind, hostSet.lcd, hostSet.swapAB);
   fprintf(f, "fullscreen=%d\npanel=%d\n", hostSet.fullscreen, hostSet.panel);
-  fprintf(f, "resume=%d\npause_away=%d\nsaves_dir=%s\n", hostSet.resume, hostSet.pauseAway, hostSet.savesFolder);
+  fprintf(f, "resume=%d\npause_away=%d\nsaves_dir=%s\nds_safe=%d\n", hostSet.resume, hostSet.pauseAway, hostSet.savesFolder,
+          hostSet.dsSafe);
   if (hostSet.winW)
     fprintf(f, "window=%d,%d,%d,%d\n", hostSet.winX, hostSet.winY, hostSet.winW, hostSet.winH);
   fprintf(f, "hk_modifier=%s\n", key_name(hostSet.modifier));
@@ -1270,6 +1274,9 @@ static bool environment(unsigned cmd, void *data) {
     // ASPECT is the companion's own (the app's SETTINGS > SCREEN): auto leaves its file's setting be.
     if (!strcmp(v->key, "pokedaisy_aspect"))
       v->value = "auto";
+    // DS ENGINE: SAFE is the interpreter; FAST leaves DSperate's own default (its recompiler).
+    if (!strcmp(v->key, "dsperate_jit") && hostSet.dsSafe)
+      v->value = "disabled";
     for (int i = 0; i < optionN && !v->value; i++)
       if (!strcmp(options[i].key, v->key))
         v->value = options[i].value;
@@ -2800,15 +2807,29 @@ static const char *base_name(const char *p) {
 static bool libraryKeyboard; // the game list's KEYBOARD row was picked: its loop opens the page
 static bool libraryHotkeys;  // its HOTKEYS row: the controller's hotkeys page
 static bool librarySaves;    // its SAVES FOLDER row: the folders page
-enum { HR_LCD, HR_FF, HR_REWIND, HR_SAVES, HR_RESUME, HR_PAUSE, HR_AB, HR_KEYBOARD, HR_HOTKEYS, HR_CONTROLLER, HR_COUNT };
+enum {
+  HR_LCD,
+  HR_FF,
+  HR_REWIND,
+  HR_DS_ENGINE,
+  HR_SAVES,
+  HR_RESUME,
+  HR_PAUSE,
+  HR_AB,
+  HR_KEYBOARD,
+  HR_HOTKEYS,
+  HR_CONTROLLER,
+  HR_COUNT
+};
 static const char *lib_label(int row) {
-  static const char *const LABELS[HR_COUNT] = {"LCD FILTER",       "FF SPEED",    "REWIND",   "SAVES FOLDER",
-                                               "CONTINUE ON OPEN", "PAUSE IN BACKGROUND", "A/B BUTTONS", "KEYBOARD",
-                                               "HOTKEYS",          "CONTROLLER"};
+  static const char *const LABELS[HR_COUNT] = {"LCD FILTER",  "FF SPEED",         "REWIND",
+                                               "DS ENGINE",   "SAVES FOLDER",     "CONTINUE ON OPEN",
+                                               "PAUSE IN BACKGROUND", "A/B BUTTONS", "KEYBOARD",
+                                               "HOTKEYS",     "CONTROLLER"};
   return LABELS[row];
 }
 static const char *lib_group(int row) {
-  return row == HR_LCD ? "SCREEN" : row <= HR_REWIND ? "FF / SPEED" : row <= HR_PAUSE ? "SAVES / PLAY" : "CONTROLS";
+  return row == HR_LCD ? "SCREEN" : row <= HR_DS_ENGINE ? "FF / SPEED" : row <= HR_PAUSE ? "SAVES / PLAY" : "CONTROLS";
 }
 static void saves_folder_name(char *out, int len); // SAVES FOLDER's value (below, with its page)
 static void lib_value(int row, char *out, int len) {
@@ -2826,6 +2847,8 @@ static void lib_value(int row, char *out, int len) {
     snprintf(out, (size_t)len, "%s", hostSet.resume ? "ON" : "OFF");
   else if (row == HR_PAUSE)
     snprintf(out, (size_t)len, "%s", hostSet.pauseAway ? "ON" : "OFF");
+  else if (row == HR_DS_ENGINE)
+    snprintf(out, (size_t)len, "%s", hostSet.dsSafe ? "SAFE" : "FAST");
   else if (row == HR_AB)
     snprintf(out, (size_t)len, "%s", hostSet.swapAB ? "SWAPPED" : "NORMAL");
   else if (row == HR_CONTROLLER) { // the controller in use, so a pad that isn't picked up shows here, not only in the log
@@ -2855,6 +2878,8 @@ static void lib_step(int row, int dir) {
     hostSet.resume = !hostSet.resume;
   else if (row == HR_PAUSE)
     hostSet.pauseAway = !hostSet.pauseAway;
+  else if (row == HR_DS_ENGINE) // read when a DS game opens
+    hostSet.dsSafe = !hostSet.dsSafe;
   else if (row == HR_AB)
     hostSet.swapAB = swapFace = !hostSet.swapAB;
   else if (row == HR_CONTROLLER)

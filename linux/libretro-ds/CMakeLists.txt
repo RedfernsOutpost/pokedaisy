@@ -15,9 +15,11 @@ foreach(feature DSPERATE_SDL DSPERATE_HEADLESS DSPERATE_TESTS DSPERATE_CHEEVOS D
   set(${feature} OFF CACHE BOOL "" FORCE)
 endforeach()
 if(APPLE)
-  # macOS: DSperate's recompiler is Linux's (signal ucontext, RWX code memory without MAP_JIT): the interpreter runs
-  # DS games, and dsperate-macos.patch covers Apple clang / Mach-O.
-  set(DSPERATE_JIT OFF CACHE BOOL "" FORCE)
+  # macOS: dsperate-macos.patch covers Apple clang / Mach-O and runs DSperate's recompiler the Mac's way (MAP_JIT code
+  # memory, no x18, no fastmem). PD_DS_JIT=OFF builds the interpreter only; the dsperate_jit core option still turns
+  # the recompiler off at run time.
+  option(PD_DS_JIT "DSperate's recompiler on macOS" ON)
+  set(DSPERATE_JIT ${PD_DS_JIT} CACHE BOOL "" FORCE)
   include(${ROOT}/third_party/patches/apply_dsperate_macos_patch.cmake)
 endif()
 add_subdirectory(${DS} dsperate EXCLUDE_FROM_ALL)

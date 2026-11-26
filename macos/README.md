@@ -30,9 +30,13 @@ its `roms/` folder and pick one from the game list. Saves, states and settings s
   armGBA's recompiler writes code into memory mapped read-write-execute, which macOS refuses without `MAP_JIT` and its
   write-protect toggling, so `core_for` picks mGBA for `.gba` on macOS. An Apple Silicon Mac runs it at full speed with
   room to spare.
-- **DS runs on DSperate's interpreter.** Its recompiler is Linux's (the signal handler reads Linux's `ucontext`, and it
-  also needs RWX memory), so `linux/libretro-ds` builds with `DSPERATE_JIT=OFF` on macOS, and
-  `third_party/patches/dsperate-macos.patch` (applied at configure time, Apple only) covers Apple clang and Mach-O.
+- **DS runs on DSperate's recompiler**, made to work the Mac's way by `third_party/patches/dsperate-macos.patch`
+  (applied at configure time, Apple only, along with its Apple clang and Mach-O fixes): the code arena is `MAP_JIT`
+  memory written inside `pthread_jit_write_protect_np` toggles, dispatch doesn't keep the arena in x18 (which macOS
+  reserves), and fastmem stays off. DSperate's `test_jit` (directed cases plus interpreter-compared fuzzing) passes on
+  an M5; HeartGold's core time per frame roughly halves. Settings → DS ENGINE → SAFE runs the interpreter instead
+  (`dsperate_jit` disabled), and `-DPD_DS_JIT=OFF` builds without the recompiler. A Developer ID build with the
+  hardened runtime needs the `com.apple.security.cs.allow-jit` entitlement.
 - The cores end in `.dylib`, and the frontend finds its own folder with `_NSGetExecutablePath` (there is no `/proc`).
 - **Xbox controllers go through macOS's GameController framework** (`SDL_HINT_JOYSTICK_HIDAPI_XBOX` is 0 on Apple).
   SDL's own HIDAPI Xbox driver opens a virtual Xbox controller ([Ekipad](https://redfernsoutpost.com/ekipad/), an iPhone controller app) but gets none of its input.
