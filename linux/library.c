@@ -1015,11 +1015,16 @@ static void update_start(void) {
  * POCKET_UPDATE_TEST="N:/path/to/DaisyLauncher-Mac.zip" (tests): that zip as release N, installed at once. */
 static void update_follow(void) {
   static bool tested;
-  const char *test = tested ? NULL : getenv("POCKET_UPDATE_TEST");
+  const char *env = tested ? NULL : getenv("POCKET_UPDATE_TEST");
+  char test[480] = "";
   tested = true;
+  if (env) {
+    snprintf(test, sizeof test, "%s", env);
+    unsetenv("POCKET_UPDATE_TEST"); // the reopened app (open passes the environment on) mustn't update again
+  }
   int testN = 0;
   char testZip[400];
-  if (test && sscanf(test, "%d:%399[^\n]", &testN, testZip) == 2 && testN > 0) {
+  if (test[0] && sscanf(test, "%d:%399[^\n]", &testN, testZip) == 2 && testN > 0) {
     snprintf(updateUrl, sizeof updateUrl, "file://%s", testZip);
     SDL_AtomicSet(&updateFound, testN);
     update_start();
