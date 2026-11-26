@@ -70,8 +70,8 @@ if [[ -n "${SDL2_DIR:-}" ]]; then
   cp "${SDL3_REAL:h:h}/LICENSE.txt" "$L/SDL3-zlib.txt"
 fi
 FORK_URL=$(git remote get-url fork 2>/dev/null || true)
-{ echo "Daisy Launcher: the unofficial Mac version of PokeDaisy by lidor30 (https://pokedaisy.com; its source was"
-  echo "  https://github.com/lidor30/pokedaisy)"; [[ -n "$FORK_URL" ]] && echo "This build: ${FORK_URL%.git}"
+{ echo "Daisy Launcher: the unofficial Mac version of PokeDaisy by lidor30 (https://pokedaisy.com, source"
+  echo "  https://gitlab.com/pokedaisy/pokedaisy; earlier https://github.com/lidor30/pokedaisy)"; [[ -n "$FORK_URL" ]] && echo "This build: ${FORK_URL%.git}"
   echo "Commit: $(git rev-parse HEAD)"; echo "mGBA: $(git rev-parse HEAD:third_party/mgba)"
   echo "DSperate: $(git rev-parse HEAD:third_party/dsperate-lr)"; echo "Build: macos/README.md at this commit"; } > "$R/SOURCE.txt"
 
