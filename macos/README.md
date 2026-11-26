@@ -1,6 +1,10 @@
-# PokeDaisy for macOS
+# Daisy Launcher (PokeDaisy for macOS)
 
-`PokeDaisy.app` is the desktop frontend in [`linux/`](../linux/README.md) (SDL2, Metal through SDL's renderer) built for
+**Daisy Launcher** is the unofficial Mac version of [PokeDaisy](https://pokedaisy.com) by lidor30, with a game launcher
+made for the Mac. It isn't made or supported by PokeDaisy's developer; the official downloads are on pokedaisy.com,
+which has no Mac version. The data folder keeps PokeDaisy's name, so earlier builds' games and saves carry over.
+
+`Daisy Launcher.app` is the desktop frontend in [`linux/`](../linux/README.md) (SDL2, Metal through SDL's renderer) built for
 Apple Silicon, with the libretro cores beside it. Everything the Linux build has works the same: the companion, the HUD,
 the quick menu, EXPAND, ZOOM, save states, fast-forward, rewind, the host menu and controller hot-plug. The controls are
 the [Linux build's](../linux/README.md#controls-and-display).
@@ -14,9 +18,11 @@ brew install cmake sdl2
 zsh macos/build.sh
 ```
 
-The app is written to `build/macos/PokeDaisy.app` (`OUT=/Applications zsh macos/build.sh` puts it elsewhere). It has an
-ad hoc signature, so it runs on the Mac that built it; a copy for other Macs would need a Developer ID signature and
-notarization. It links Homebrew's SDL2.
+The app is written to `build/macos/Daisy Launcher.app` (`OUT=/Applications zsh macos/build.sh` puts it elsewhere). It
+has an ad hoc signature, so it runs on the Mac that built it. `SIGN_ID="Developer ID Application: ..."` signs it for
+other Macs instead (hardened runtime, secure timestamp, `macos/entitlements.plist` for the DS recompiler's `MAP_JIT`);
+then zip it, notarize the zip (`xcrun notarytool submit ... --wait`), staple the app (`xcrun stapler staple`) and zip it
+again. SDL comes from Homebrew and is copied into the app.
 
 ## Games and saves
 

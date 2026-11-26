@@ -913,9 +913,14 @@ static enum net lr_get(const char *url, char **body) {
 }
 
 #ifdef __APPLE__
+#define PD_NO_GAMES "No Pokemon games found. File > Add Games, or drop one on the window."
+#else
+#define PD_NO_GAMES "No Pokemon games found. Put them in roms/ beside PokeDaisy."
+#endif
+#ifdef __APPLE__
 /* PokeDaisy for Mac's own releases (RedfernsOutpost/pokedaisy, tags mac-launcher-N): this build is N = PD_MAC_RELEASE.
  * Looked up once a start, in the background; a newer one is said along the bottom and SETTINGS > VERSION opens it. */
-#define PD_MAC_RELEASE 3
+#define PD_MAC_RELEASE 4
 static const char *lr_json(const char *from, const char *key, char *out, size_t len);
 static int run_wait(const char *const *argv);
 static void say(const char *text);
@@ -1389,7 +1394,7 @@ void library_tick(void) {
 #ifdef __APPLE__
   if (SDL_AtomicGet(&updateFound) && !updateSaid) {
     char said[96];
-    snprintf(said, sizeof said, "PokeDaisy for Mac %d is out: SETTINGS > VERSION to get it", SDL_AtomicGet(&updateFound));
+    snprintf(said, sizeof said, "Daisy Launcher %d is out: SETTINGS > VERSION to get it", SDL_AtomicGet(&updateFound));
     say(said);
     noticeUntil = SDL_GetTicks() + 6000;
     updateSaid = true;
@@ -2352,7 +2357,7 @@ static void draw_games(struct pd_canvas *c) {
   if (!shownCount) {
     int f = pd_list_box(c, contentX, contentY, contentW, 44);
     pd_text_fit(c, contentX + f + 8, contentY + 14, contentW - 2 * f - 16,
-                gameCount ? "No games in this view yet." : "No Pokemon games found. Put them in roms/ beside PokeDaisy.",
+                gameCount ? "No games in this view yet." : PD_NO_GAMES,
                 PD_LABEL, PD_LABEL_SHADOW);
     return;
   }
@@ -2508,7 +2513,11 @@ void library_draw(struct pd_canvas *c) {
   contentX = x;
   contentW = w;
   if (page == P_GAMES) {
+#ifdef __APPLE__
+    draw_header(c, x, w, "DAISY LAUNCHER", true); // the Mac build's own name (unofficial, based on PokeDaisy)
+#else
     draw_header(c, x, w, "POKéDAISY", true);
+#endif
     int py = M + HEADER_H + GAP;
     draw_pills(c, x, py, w);
     contentY = py + PILL_H + GAP;
@@ -2615,7 +2624,11 @@ void library_draw_top(struct pd_canvas *c, uint32_t clear) {
     const char *rows[2] = {"YES", "NO"};
     int w = 240, h = 2 * 6 + 24 + 2 * 24 + 4;
     int x = (c->w - w) / 2, y = (c->h - h) / 2;
+#ifdef __APPLE__
+    int f = window(c, x, y, w, h, "CLOSE DAISY LAUNCHER?", rows, 2, menuCursor);
+#else
     int f = window(c, x, y, w, h, "CLOSE POKéDAISY?", rows, 2, menuCursor);
+#endif
     for (int i = 0; i < 2; i++)
       hit_add(x + f + 2, y + f + 4 + 24 + i * 24, w - 2 * f - 4, 22, LIB_HIT_CLOSE, i);
   }

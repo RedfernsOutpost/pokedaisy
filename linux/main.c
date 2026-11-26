@@ -53,7 +53,7 @@ extern char **environ;
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
 #define PD_CORE_EXT ".dylib"
-#define PD_HOST_NAME "PokeDaisy"
+#define PD_HOST_NAME "Daisy Launcher" // the Mac build's own name: unofficial, based on PokeDaisy
 #else
 #define PD_CORE_EXT ".so"
 #define PD_HOST_NAME "PokeDaisy Linux"
@@ -3437,6 +3437,19 @@ int main(int argc, char **argv) {
       rom = argv[i];
   }
   exe_dir(argv[0]);
+#ifdef __APPLE__
+  // The app opens the binary straight from the bundle (no launcher script): its data folder is PokeDaisy's own, kept
+  // since Mac 1 so games, saves and settings stay where they were.
+  static char macData[PATH_MAX];
+  if (!strcmp(root, ".") && getenv("HOME")) {
+    snprintf(macData, sizeof macData, "%s/Library", getenv("HOME"));
+    pd_mkdir(macData); // both are always there on a real account; a fresh HOME (tests) has neither
+    snprintf(macData, sizeof macData, "%s/Library/Application Support", getenv("HOME"));
+    pd_mkdir(macData);
+    snprintf(macData, sizeof macData, "%s/Library/Application Support/PokeDaisy", getenv("HOME"));
+    root = macData;
+  }
+#endif
   signal(SIGINT, stop);
   signal(SIGTERM, stop);
 #ifdef SIGHUP // a closed terminal or session: the save goes to the card like a quit (no SIGHUP on Windows)

@@ -26,7 +26,7 @@ static void (*addGame)(const char *path);
   NSOpenPanel *panel = [NSOpenPanel openPanel];
   panel.allowsMultipleSelection = YES;
   panel.canChooseDirectories = NO;
-  panel.message = @"Game files to add to PokeDaisy (.gb, .gbc, .gba, .nds or .zip)";
+  panel.message = @"Game files to add to Daisy Launcher (.gb, .gbc, .gba, .nds or .zip)";
   panel.prompt = @"Add";
   if ([panel runModal] != NSModalResponseOK || !addGame)
     return;
@@ -113,7 +113,7 @@ void mac_menu_install(void (*add_game)(const char *path), const int *codes) {
   [game addItem:command(@"Screenshot", @"s", cmd, M_SHOT)];
 
   NSMenu *help = [[NSMenu alloc] initWithTitle:@"Help"];
-  [help addItem:command(@"PokeDaisy for Mac Downloads", @"", 0, M_RELEASES)];
+  [help addItem:command(@"Daisy Launcher Downloads", @"", 0, M_RELEASES)];
 
   menu_insert(bar, file, 1);
   menu_insert(bar, view, 2);

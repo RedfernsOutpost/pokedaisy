@@ -1,8 +1,10 @@
 #!/bin/zsh
-# Builds PokeDaisy for macOS (Apple Silicon) from the SDL2 desktop frontend in linux/ and packs PokeDaisy.app.
-# Needs the Xcode Command Line Tools, CMake 3.18+ and SDL2 (Homebrew: brew install cmake sdl2). See macos/README.md.
-#   zsh macos/build.sh              # -> build/macos/PokeDaisy.app
+# Builds Daisy Launcher (the unofficial Mac version of PokeDaisy, Apple Silicon) from the SDL2 desktop frontend in
+# linux/ and packs Daisy Launcher.app. Needs the Xcode Command Line Tools, CMake 3.18+ and SDL2 (Homebrew: brew install
+# cmake sdl2). See macos/README.md.
+#   zsh macos/build.sh              # -> build/macos/Daisy Launcher.app, ad hoc signed
 #   OUT=/Applications zsh macos/build.sh
+#   SIGN_ID="Developer ID Application: ..." zsh macos/build.sh   # hardened runtime + macos/entitlements.plist
 set -e
 ROOT="${0:A:h:h}"
 cd "$ROOT"
@@ -24,13 +26,13 @@ cmake -S linux -B "$B/host" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PRE
   -DPOCKET_VERSION="$VER" >/dev/null
 cmake --build "$B/host" --target pokedaisy-linux -j$J
 
-APP="$OUT/PokeDaisy.app"
+APP="$OUT/Daisy Launcher.app"
 M="$APP/Contents/MacOS"
 rm -rf "$APP"; mkdir -p "$M" "$APP/Contents/Resources"
-# The binary isn't named "pokedaisy": a case-insensitive disk would make it the same file as the PokeDaisy launcher.
-cp "$B/host/pokedaisy-linux" "$M/pokedaisy-host"
+# The frontend is the bundle's executable (it finds its data folder itself; see main.c), so the hardened runtime and
+# the JIT entitlement apply to it directly.
+cp "$B/host/pokedaisy-linux" "$M/DaisyLauncher"
 cp "$B/gbc/pokedaisy_gbc_libretro.dylib" "$B/ds/pokedaisy_ds_libretro.dylib" "$M/"
-cp macos/PokeDaisy.sh "$M/PokeDaisy"; chmod +x "$M/PokeDaisy"
 sed "s/@VERSION@/$VER/g" macos/Info.plist > "$APP/Contents/Info.plist"
 IS="$B/AppIcon.iconset"; rm -rf "$IS"; mkdir -p "$IS"
 for s in 16 32 128 256 512; do
@@ -41,7 +43,7 @@ iconutil -c icns "$IS" -o "$APP/Contents/Resources/AppIcon.icns"
 # SDL inside the app, so it runs on a Mac without Homebrew: sdl2-compat (what the host links) beside SDL3, which
 # sdl2-compat loads from its own folder (@loader_path/libSDL3.dylib).
 F="$APP/Contents/Frameworks"; mkdir -p "$F"
-SDL2=$(otool -L "$M/pokedaisy-host" | awk '/libSDL2-2\.0\.0\.dylib/{print $1; exit}')
+SDL2=$(otool -L "$M/DaisyLauncher" | awk '/libSDL2-2\.0\.0\.dylib/{print $1; exit}')
 if [[ "$SDL2" == /* ]]; then
   SDL2_REAL=$(realpath "$SDL2"); SDL2_DIR="${SDL2_REAL:h}"
   cp "$SDL2_REAL" "$F/libSDL2-2.0.0.dylib"
@@ -50,7 +52,7 @@ if [[ "$SDL2" == /* ]]; then
   chmod u+w "$F"/*.dylib
   install_name_tool -id @rpath/libSDL2-2.0.0.dylib "$F/libSDL2-2.0.0.dylib" 2>/dev/null
   install_name_tool -id @rpath/libSDL3.dylib "$F/libSDL3.dylib" 2>/dev/null
-  install_name_tool -change "$SDL2" @executable_path/../Frameworks/libSDL2-2.0.0.dylib "$M/pokedaisy-host"
+  install_name_tool -change "$SDL2" @executable_path/../Frameworks/libSDL2-2.0.0.dylib "$M/DaisyLauncher"
 fi
 
 # Licenses and where the source is (the same notices linux/package.py ships).
@@ -68,12 +70,21 @@ if [[ -n "${SDL2_DIR:-}" ]]; then
   cp "${SDL3_REAL:h:h}/LICENSE.txt" "$L/SDL3-zlib.txt"
 fi
 FORK_URL=$(git remote get-url fork 2>/dev/null || true)
-{ echo "Source: https://github.com/lidor30/pokedaisy"; [[ -n "$FORK_URL" ]] && echo "This build: ${FORK_URL%.git}"
+{ echo "Daisy Launcher: the unofficial Mac version of PokeDaisy by lidor30 (https://pokedaisy.com; its source was"
+  echo "  https://github.com/lidor30/pokedaisy)"; [[ -n "$FORK_URL" ]] && echo "This build: ${FORK_URL%.git}"
   echo "Commit: $(git rev-parse HEAD)"; echo "mGBA: $(git rev-parse HEAD:third_party/mgba)"
   echo "DSperate: $(git rev-parse HEAD:third_party/dsperate-lr)"; echo "Build: macos/README.md at this commit"; } > "$R/SOURCE.txt"
 
-# Ad hoc signature (Apple Silicon runs nothing unsigned). A release would sign with a Developer ID and notarize.
-for f in "$F"/*.dylib(N) "$M"/*.dylib "$M/pokedaisy-host"; do codesign --force -s - "$f"; done
-codesign --force -s - "$APP"
-codesign --verify "$APP"
+# Ad hoc signature by default (Apple Silicon runs nothing unsigned). SIGN_ID signs for release: hardened runtime, a
+# secure timestamp, and the JIT entitlement on the executable; notarize the zip afterwards.
+if [[ -n "${SIGN_ID:-}" ]]; then
+  for f in "$F"/*.dylib(N) "$M"/*.dylib; do codesign --force --options runtime --timestamp -s "$SIGN_ID" "$f"; done
+  codesign --force --options runtime --timestamp --entitlements macos/entitlements.plist -s "$SIGN_ID" "$M/DaisyLauncher"
+  codesign --force --options runtime --timestamp --entitlements macos/entitlements.plist -s "$SIGN_ID" "$APP"
+  codesign --verify --strict --deep "$APP"
+else
+  for f in "$F"/*.dylib(N) "$M"/*.dylib "$M/DaisyLauncher"; do codesign --force -s - "$f"; done
+  codesign --force -s - "$APP"
+  codesign --verify "$APP"
+fi
 echo ">> $APP ($VER)"
