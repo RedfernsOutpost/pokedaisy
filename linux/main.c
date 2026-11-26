@@ -34,6 +34,15 @@
 #include "pd_zip.h"
 
 #include "library.h"
+#ifdef __APPLE__
+#include "mac_menu.h"
+#endif
+#ifndef _WIN32
+#include <glob.h>
+#include <spawn.h>
+#include <sys/wait.h>
+extern char **environ;
+#endif
 
 /* The cores' file ending: dlopen'd .so objects on Linux, .dll on Windows, .dylib on macOS. */
 #ifdef _WIN32
@@ -370,6 +379,17 @@ static int mouseWindowX, mouseWindowY; // the pointer over the window, for the l
 static bool libraryClick;              // a left press this frame
 static bool libraryRightClick;         // a right press (or control-click) this frame: a game's menu
 static char libraryDropped[PATH_MAX * 2]; // a file or an image's address dropped on the window: the picked game's cover
+/* Files picked in the menu bar's File > Add Games... (added to DATA/roms when the game list is up). */
+static char addQueue[16][PATH_MAX];
+static int addQueued;
+static void menu_add_game(const char *path) {
+  const char *ext = strrchr(path, '.');
+  if (!ext || (strcasecmp(ext, ".gb") && strcasecmp(ext, ".gbc") && strcasecmp(ext, ".gba") && strcasecmp(ext, ".nds") &&
+               strcasecmp(ext, ".zip")) || addQueued >= 16)
+    return;
+  snprintf(addQueue[addQueued++], PATH_MAX, "%s", path);
+}
+static bool windowAway;                // another window has the focus (PAUSE IN BACKGROUND)
 static bool listShown;                 // the game list is up (not a game): its shortcuts and search take keys
 static int libraryWheel;               // wheel notches this frame (+ up)
 
@@ -444,33 +464,67 @@ static void script_rawkeys(void) {
 }
 /* Keys that aren't buttons: Cmd+Ctrl+F or F11 (fullscreen) anywhere; in the game list Cmd+F (search), Cmd+, (SETTINGS),
  * Cmd + / Cmd - / Cmd+0 (cover size), and while the search box is open, the keys it types. True when taken. */
+/* What the keys below and the Mac's menu bar (mac_menu.m, as SDL_USEREVENTs) ask for. */
+enum { CMD_FULLSCREEN = 1, CMD_SEARCH, CMD_SETTINGS, CMD_BIGGER, CMD_SMALLER, CMD_ACTUAL, CMD_SCREENSHOT,
+       CMD_GAMES_FOLDER, CMD_GAME_MENU, CMD_SAVE_STATE, CMD_LOAD_STATE, CMD_RELEASES };
+static bool screenshotWanted; // the game loop saves the next frame to Pictures > PokeDaisy
+static bool command(int c) {
+  if (c == CMD_FULLSCREEN) {
+    bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+    SDL_SetWindowFullscreen(window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+    return true;
+  }
+  if (c == CMD_GAMES_FOLDER || c == CMD_RELEASES) {
+#ifndef _WIN32
+    char dir[PATH_MAX + 8];
+    snprintf(dir, sizeof dir, "%s/roms", root);
+#ifdef __APPLE__
+    const char *argv[] = {"open", c == CMD_RELEASES ? "https://github.com/RedfernsOutpost/pokedaisy/releases/latest" : dir, NULL};
+#else
+    const char *argv[] = {"xdg-open", c == CMD_RELEASES ? "https://github.com/RedfernsOutpost/pokedaisy/releases/latest" : dir, NULL};
+#endif
+    pid_t pid;
+    if (!posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ))
+      waitpid(pid, NULL, 0);
+#endif
+    return true;
+  }
+  if (!listShown) { // in a game
+    if (c == CMD_SCREENSHOT)
+      screenshotWanted = true;
+    else if (c == CMD_GAME_MENU)
+      pressed |= 1u << MENU;
+    else if (c == CMD_SAVE_STATE)
+      pressed |= 1u << SAVEKEY;
+    else if (c == CMD_LOAD_STATE)
+      pressed |= 1u << LOADKEY;
+    else
+      return false;
+    return true;
+  }
+  if (c == CMD_SEARCH)
+    library_search_open();
+  else if (c == CMD_SETTINGS)
+    library_settings_open();
+  else if (c == CMD_BIGGER || c == CMD_SMALLER || c == CMD_ACTUAL)
+    library_zoom(c == CMD_BIGGER ? 1 : c == CMD_SMALLER ? -1 : 0);
+  else
+    return false;
+  return true;
+}
 static bool shortcut(const SDL_KeyboardEvent *k) {
   SDL_Keycode sym = k->keysym.sym;
   Uint16 mod = k->keysym.mod;
   bool cmd = (mod & KMOD_GUI) != 0;
-  if (sym == SDLK_F11 || (cmd && (mod & KMOD_CTRL) && sym == SDLK_f)) {
-    if (!k->repeat) {
-      bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-      SDL_SetWindowFullscreen(window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
-    }
-    return true;
-  }
-  if (!listShown)
-    return false;
+  if (sym == SDLK_F11 || (cmd && (mod & KMOD_CTRL) && sym == SDLK_f))
+    return k->repeat || command(CMD_FULLSCREEN);
+  if (!listShown) // in a game: F12 or Cmd+S, a screenshot
+    return (sym == SDLK_F12 || (cmd && sym == SDLK_s)) && (k->repeat || command(CMD_SCREENSHOT));
   if (cmd) {
-    if (sym == SDLK_f)
-      library_search_open();
-    else if (sym == SDLK_COMMA)
-      library_settings_open();
-    else if (sym == SDLK_EQUALS || sym == SDLK_PLUS || sym == SDLK_KP_PLUS)
-      library_zoom(1);
-    else if (sym == SDLK_MINUS || sym == SDLK_KP_MINUS)
-      library_zoom(-1);
-    else if (sym == SDLK_0)
-      library_zoom(0);
-    else
-      return false; // Cmd+Q and the rest: the system's
-    return true;
+    int c = sym == SDLK_f ? CMD_SEARCH : sym == SDLK_COMMA ? CMD_SETTINGS
+          : sym == SDLK_EQUALS || sym == SDLK_PLUS || sym == SDLK_KP_PLUS ? CMD_BIGGER
+          : sym == SDLK_MINUS || sym == SDLK_KP_MINUS ? CMD_SMALLER : sym == SDLK_0 ? CMD_ACTUAL : 0;
+    return c && command(c); // Cmd+Q and the rest: the system's
   }
   if (!library_searching())
     return false;
@@ -586,7 +640,12 @@ static void events(void) {
       wheelSteps += steps;
       libraryWheel += steps;
     }
+    if (e.type == SDL_USEREVENT) // the menu bar
+      command(e.user.code);
+    if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+      windowAway = false;
     if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+      windowAway = true;
       inputReset = true;
       held = pressed = 0;
       pointerHeld = false; // its button-up may go to the window that took the focus
@@ -711,7 +770,10 @@ static struct {
   bool fullscreen; // the WINDOW setting
   int panel;       // the PANEL setting: 0 = the window's size, else a preset the core lays out for
   int winX, winY, winW, winH; // where the window was at the last quit (winW 0: never saved)
-} hostSet = {0, false, false, false, {R2, L2, -1, -1}, {R2, L2, -1, -1}, SELECT, false, 0, 0, 0, 0, 0};
+  bool resume;    // CONTINUE ON OPEN: a game opens where it was left (its state at the last quit)
+  bool pauseAway; // PAUSE IN BACKGROUND: the game waits while another window has the focus
+  char savesFolder[PATH_MAX]; // SAVES FOLDER: "" = DATA/saves, else that folder (iCloud Drive, Google Drive, ...)
+} hostSet = {0, false, false, false, {R2, L2, -1, -1}, {R2, L2, -1, -1}, SELECT, false, 0, 0, 0, 0, 0, true, true, ""};
 static char hostIni[PATH_MAX];
 /* A DS game's L2 / R2 are its companion and screen buttons: with no modifier held for them, its FAST FORWARD and REWIND
  * go back to the stick clicks (R3 / L3), and come back to R2 / L2 when a modifier is picked again. */
@@ -736,7 +798,7 @@ static void modifier_takes(int k) {
 }
 static void host_load(void) {
   FILE *f = fopen(hostIni, "r");
-  char line[128];
+  char line[PATH_MAX + 32];
   int v;
   bool modifierSaved = false;
   while (f && fgets(line, sizeof line, f)) {
@@ -752,6 +814,14 @@ static void host_load(void) {
       hostSet.fullscreen = v != 0;
     if (sscanf(line, "panel=%d", &v) == 1 && v >= 0 && v < PD_PANEL_PRESETS)
       hostSet.panel = v;
+    if (sscanf(line, "resume=%d", &v) == 1)
+      hostSet.resume = v != 0;
+    if (sscanf(line, "pause_away=%d", &v) == 1)
+      hostSet.pauseAway = v != 0;
+    if (!strncmp(line, "saves_dir=", 10)) {
+      snprintf(hostSet.savesFolder, sizeof hostSet.savesFolder, "%s", line + 10);
+      hostSet.savesFolder[strcspn(hostSet.savesFolder, "\r\n")] = 0;
+    }
     int wx, wy, ww, wh;
     if (sscanf(line, "window=%d,%d,%d,%d", &wx, &wy, &ww, &wh) == 4 && ww >= 160 && wh >= 144 && ww <= 16384 && wh <= 16384)
       hostSet.winX = wx, hostSet.winY = wy, hostSet.winW = ww, hostSet.winH = wh;
@@ -794,6 +864,7 @@ static void host_write(void) {
     return;
   fprintf(f, "ff_speed=%d\nrewind=%d\nlcd=%d\nswap_ab=%d\n", hostSet.ffSpeed, hostSet.rewind, hostSet.lcd, hostSet.swapAB);
   fprintf(f, "fullscreen=%d\npanel=%d\n", hostSet.fullscreen, hostSet.panel);
+  fprintf(f, "resume=%d\npause_away=%d\nsaves_dir=%s\n", hostSet.resume, hostSet.pauseAway, hostSet.savesFolder);
   if (hostSet.winW)
     fprintf(f, "window=%d,%d,%d,%d\n", hostSet.winX, hostSet.winY, hostSet.winW, hostSet.winH);
   fprintf(f, "hk_modifier=%s\n", key_name(hostSet.modifier));
@@ -1428,6 +1499,10 @@ static void render_lcd(void) {
   if (lcdTexture)
     SDL_RenderCopy(renderer, lcdTexture, NULL, NULL);
 }
+/* A save-state slot's picture (SAVE STATE / LOAD STATE pages): drawn beside the slots. */
+static SDL_Texture *slotThumb;
+static bool slotThumbShow;
+static int slotThumbW, slotThumbH;
 static double presentMs;
 static void present_game(const struct pd_menu *menu) {
   int ow = W, oh = H;
@@ -1509,6 +1584,16 @@ static void present_game(const struct pd_menu *menu) {
   any |= overlay_notice();
   if (any)
     overlay_draw(false);
+  if (menu && slotThumbShow && slotThumb && slotThumbW > 0) { // the slot's picture, at the right of its rows
+    int tw = ow * 2 / 5, th = tw * slotThumbH / slotThumbW;
+    if (th > oh / 2)
+      th = oh / 2, tw = th * slotThumbW / slotThumbH;
+    SDL_Rect border = {ow - tw - ow / 14 - 3, oh / 4 - 3, tw + 6, th + 6}, dst = {border.x + 3, border.y + 3, tw, th};
+    SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+    SDL_RenderFillRect(renderer, &border);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderCopy(renderer, slotThumb, NULL, &dst);
+  }
   uint64_t t = SDL_GetPerformanceCounter();
   SDL_RenderPresent(renderer);
   presentMs += (double)(SDL_GetPerformanceCounter() - t) * 1000.0 / SDL_GetPerformanceFrequency();
@@ -1993,6 +2078,104 @@ static bool unzip_game(const char *zip, char *out, size_t size) {
     return true;
   return pd_zip_extract(zip, &e, out);
 }
+/* Save-state slots: SLOT 1 is the state file the host always had (states/<game>.ss), 2-4 beside it (.s2.ss ...), and
+ * slot 0 the one written when the game is left (.auto.ss: CONTINUE ON OPEN, LOAD STATE > WHERE YOU QUIT). Each has a
+ * small picture of the game beside it (<state>.bmp). The hotkeys and the menu bar use the slot last saved to. */
+#define SLOTS 4
+static int slotNow = 1;
+static void slot_path(const char *ss, int slot, char *out, size_t size) {
+  int stem = (int)strlen(ss) - 3; // without ".ss"
+  if (slot == 1)
+    snprintf(out, size, "%s", ss);
+  else if (slot)
+    snprintf(out, size, "%.*s.s%d.ss", stem, ss, slot);
+  else
+    snprintf(out, size, "%.*s.auto.ss", stem, ss);
+}
+// The frame as it is now, small, into <state>.bmp: drawn to the back buffer (the next present clears it) and read back.
+static void thumb_write(const char *state) {
+  if (!frameTexture || frameW <= 0 || frameH <= 0)
+    return;
+  int tw = 192, th = tw * frameH / frameW;
+  if (th > 192)
+    th = 192, tw = th * frameW / frameH;
+  SDL_Surface *img = SDL_CreateRGBSurfaceWithFormat(0, tw, th, 32, SDL_PIXELFORMAT_ARGB8888);
+  if (!img)
+    return;
+  SDL_Rect src = {0, 0, frameW, frameH}, dst = {0, 0, tw, th};
+  SDL_RenderClear(renderer);
+  SDL_RenderCopy(renderer, frameTexture, &src, &dst);
+  char bmp[PATH_MAX * 2 + 8];
+  snprintf(bmp, sizeof bmp, "%s.bmp", state);
+  if (!SDL_RenderReadPixels(renderer, &dst, SDL_PIXELFORMAT_ARGB8888, img->pixels, img->pitch))
+    SDL_SaveBMP(img, bmp);
+  SDL_FreeSurface(img);
+}
+static void slot_thumb_load(const char *state) {
+  if (slotThumb)
+    SDL_DestroyTexture(slotThumb);
+  slotThumb = NULL;
+  char bmp[PATH_MAX * 2 + 8];
+  snprintf(bmp, sizeof bmp, "%s.bmp", state);
+  SDL_Surface *img = exists(state) ? SDL_LoadBMP(bmp) : NULL;
+  if (!img)
+    return;
+  slotThumb = SDL_CreateTextureFromSurface(renderer, img);
+  slotThumbW = img->w;
+  slotThumbH = img->h;
+  SDL_FreeSurface(img);
+}
+static bool slot_save(const char *ss, int slot) {
+  char path[PATH_MAX * 2 + 16];
+  slot_path(ss, slot, path, sizeof path);
+  if (!state_file(path, true))
+    return false;
+  thumb_write(path);
+  return true;
+}
+// The slot pages' rows: SLOT 1..4 with when each was saved (or EMPTY), and LOAD STATE's WHERE YOU QUIT.
+static void slot_rows(const char *ss, char rows[][48], const char **ptrs, int count) {
+  for (int i = 0; i < count; i++) {
+    char path[PATH_MAX * 2 + 16], when[32] = "EMPTY";
+    const int slot = i < SLOTS ? i + 1 : 0;
+    slot_path(ss, slot, path, sizeof path);
+    struct stat st;
+    if (!stat(path, &st)) {
+      strftime(when, sizeof when, "%b %d %I:%M %p", localtime(&st.st_mtime));
+      for (char *q = when; *q; q++)
+        *q = (char)toupper((unsigned char)*q);
+    }
+    if (slot)
+      snprintf(rows[i], 48, "SLOT %d  %s", slot, when);
+    else
+      snprintf(rows[i], 48, "WHERE YOU QUIT  %s", when);
+    ptrs[i] = rows[i];
+  }
+}
+// F12 / Cmd+S in a game: the screen as it is, Pictures/PokeDaisy/<game> <date>.png (DATA/screenshots off a Mac).
+static void screenshot_save(const char *game) {
+  char dir[PATH_MAX], path[PATH_MAX * 2], stamp[48];
+  const char *home = getenv("HOME");
+#ifdef __APPLE__
+  if (home) {
+    snprintf(dir, sizeof dir, "%s/Pictures", home);
+    pd_mkdir(dir);
+    snprintf(dir, sizeof dir, "%s/Pictures/PokeDaisy", home);
+  } else
+#endif
+    snprintf(dir, sizeof dir, "%s/screenshots", root);
+  (void)home;
+  pd_mkdir(dir);
+  const char *file = strrchr(game, '/') ? strrchr(game, '/') + 1 : game, *dot = strrchr(file, '.');
+  time_t now = time(NULL);
+  strftime(stamp, sizeof stamp, "%Y-%m-%d at %H.%M.%S", localtime(&now));
+  snprintf(path, sizeof path, "%s/%.*s %s.png", dir, dot && dot != file ? (int)(dot - file) : (int)strlen(file), file, stamp);
+#ifdef __APPLE__
+  notice(capture(path) ? "Screenshot saved in Pictures > PokeDaisy" : "Screenshot failed");
+#else
+  notice(capture(path) ? "Screenshot saved in DATA/screenshots" : "Screenshot failed");
+#endif
+}
 static void run_game_play(const char *path, int maxFrames, const char *shot, bool fromList) {
   listShown = false;
   // The save and the states are named after the file in the list (a zip's own name); the core plays its game unpacked.
@@ -2115,6 +2298,19 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
     if (sramCopy.data)
       sramCopy.size = save_image(sramCopy.data);
   }
+  // CONTINUE ON OPEN: the state written when the game was last left, unless the save is newer (played elsewhere since:
+  // a cloud folder's save from another computer, or the game ended without its state).
+  char autoSS[PATH_MAX * 2 + 16];
+  slot_path(ss, 0, autoSS, sizeof autoSS);
+  {
+    struct stat a, v;
+    if (hostSet.resume && !stat(autoSS, &a)) {
+      if (!stat(sav, &v) && v.st_mtime > a.st_mtime)
+        notice("Your save is newer than where you quit: started from your save");
+      else if (state_file(autoSS, false))
+        notice("Picked up where you left off");
+    }
+  }
   int rewindMB = getenv("POCKET_REWIND_MB") ? atoi(getenv("POCKET_REWIND_MB")) : 32;
   rewindBudget = (size_t)(rewindMB > 0 ? rewindMB : 32) << 20; // a bad value (negative, 0) is the default
   rewindTick = 0;
@@ -2132,6 +2328,14 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
   struct pd_menu confirmMenu;
   static const char *confirmRows[2];
   int confirming = 0; // the menu row asked about (M_LOAD / M_QUIT), 0 = none
+  int slotPage = 0;   // SAVE STATE's slots (1) or LOAD STATE's (2), 0 = none
+  struct pd_menu slotMenu;
+  static char slotRowText[SLOTS + 1][48];
+  static const char *slotPtrs[SLOTS + 1];
+  char loadPath[PATH_MAX * 2 + 16]; // the state LOAD STATE's question is about
+  snprintf(loadPath, sizeof loadPath, "%s", ss);
+  int thumbFor = -1; // the slot whose picture is loaded
+  bool pausedAway = false;
   int frames = 0;
   uint64_t due = SDL_GetPerformanceCounter(), lastStart = 0, lastFrame = due;
   ffQuick = false; // a new game starts at normal speed
@@ -2149,6 +2353,20 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
       outputChanged = false;
       panel_follow();
     }
+    // PAUSE IN BACKGROUND: nothing runs while another window has the focus; the picture stays.
+    if (windowAway && hostSet.pauseAway && !maxFrames) {
+      if (!pausedAway)
+        notice("Paused: click the window to play");
+      pausedAway = true;
+      muted = true;
+      if (audio)
+        SDL_ClearQueuedAudio(audio);
+      present_game(NULL);
+      SDL_Delay(30);
+      due = SDL_GetPerformanceCounter();
+      continue;
+    }
+    pausedAway = false;
     const unsigned menuChord = (1u << START) | (1u << SELECT);
     const bool menuChordDown = (held & menuChord) == menuChord;
     bool menuKey = down(MENU) || (comboMenu && menuChordDown && (pressed & menuChord));
@@ -2192,6 +2410,7 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
       menuOpen = !menuOpen;
       hkPage = false, kbPage = false;
       confirming = 0;
+      slotPage = 0;
       capturing = -1;
       kbCapture = -1;
       if (menuOpen) {
@@ -2227,10 +2446,16 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
     } else
       pulseLeft = 0;
     hotkeyMask |= latched | menuConsumed;
-    if (hkFired & (1u << HK_SAVE))
-      notice(state_file(ss, true) ? "State saved" : "State save failed");
-    if (hkFired & (1u << HK_LOAD))
-      notice(!exists(ss) ? "No state saved yet" : state_file(ss, false) ? "State loaded" : "State load failed");
+    if (hkFired & ((1u << HK_SAVE) | (1u << HK_LOAD))) { // the slot last saved to
+      char slotFile[PATH_MAX * 2 + 16], said[48];
+      slot_path(ss, slotNow, slotFile, sizeof slotFile);
+      if (hkFired & (1u << HK_SAVE))
+        snprintf(said, sizeof said, slot_save(ss, slotNow) ? "State saved (slot %d)" : "State save failed", slotNow);
+      else
+        snprintf(said, sizeof said, !exists(slotFile) ? "No state in slot %d yet"
+                                    : state_file(slotFile, false) ? "State loaded (slot %d)" : "State load failed", slotNow);
+      notice(said);
+    }
     if ((hkFired & (1u << HK_REWIND)) && !hostSet.rewind)
       notice("REWIND is off: turn it on in the menu");
     const bool menuFrame = menuOpen; // the frame that closes the menu is still the menu's
@@ -2279,12 +2504,43 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
         confirming = 0;
       if (down(A)) {
         if (confirmMenu.selected == 1 && confirming == M_LOAD) {
-          notice(state_file(ss, false) ? "State loaded" : "State load failed");
+          notice(state_file(loadPath, false) ? "State loaded" : "State load failed");
           menuOpen = false;
+          slotPage = 0;
         } else if (confirmMenu.selected == 1 && confirming == M_QUIT) {
           leave = true;
         }
         confirming = 0;
+      }
+    } else if (menuOpen && slotPage) {
+      if (down(UP))
+        pd_menu_move(&slotMenu, -1);
+      if (down(DOWN))
+        pd_menu_move(&slotMenu, 1);
+      if (down(B))
+        slotPage = 0;
+      else if (down(A)) {
+        const int slot = slotMenu.selected < SLOTS ? slotMenu.selected + 1 : 0;
+        char slotFile[PATH_MAX * 2 + 16], said[48];
+        slot_path(ss, slot, slotFile, sizeof slotFile);
+        if (slotPage == 1) {
+          snprintf(said, sizeof said, slot_save(ss, slot) ? "State saved (slot %d)" : "State save failed", slot);
+          slotNow = slot;
+          notice(said);
+          menuOpen = false;
+          slotPage = 0;
+        } else if (!exists(slotFile)) {
+          notice("That slot is empty");
+        } else {
+          snprintf(loadPath, sizeof loadPath, "%s", slotFile);
+          if (slot)
+            slotNow = slot;
+          confirming = M_LOAD;
+          confirmRows[0] = "CANCEL";
+          confirmRows[1] = "LOAD STATE";
+          pd_menu_init(&confirmMenu, "LOAD THE STATE?", confirmRows, 2);
+          confirmMenu.overlay = true;
+        }
       }
     } else if (menuOpen && hkPage) {
       if (down(UP))
@@ -2348,20 +2604,14 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
           menuOpen = false;
           break;
         case M_SAVE:
-          notice(state_file(ss, true) ? "State saved" : "State save failed");
-          menuOpen = false;
-          break;
         case M_LOAD:
-          if (!exists(ss)) {
-            notice("No state saved yet");
-            menuOpen = false;
-            break;
-          }
-          confirming = M_LOAD;
-          confirmRows[0] = "CANCEL";
-          confirmRows[1] = "LOAD STATE";
-          pd_menu_init(&confirmMenu, "LOAD THE STATE?", confirmRows, 2);
-          confirmMenu.overlay = true;
+          slotPage = menu.selected == M_SAVE ? 1 : 2;
+          slot_rows(ss, slotRowText, slotPtrs, slotPage == 1 ? SLOTS : SLOTS + 1);
+          pd_menu_init(&slotMenu, slotPage == 1 ? "SAVE STATE: PICK A SLOT" : "LOAD STATE: PICK A SLOT", slotPtrs,
+                       slotPage == 1 ? SLOTS : SLOTS + 1);
+          slotMenu.overlay = true;
+          slotMenu.selected = slotNow - 1;
+          thumbFor = -1;
           break;
         case M_FFSPEED:
           hostSet.ffSpeed = hostSet.ffSpeed == 0 ? 2 : hostSet.ffSpeed >= 8 ? 0 : hostSet.ffSpeed + 1;
@@ -2404,7 +2654,15 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
     if (menuFrame) {
       muted = true;
       gameKeys = 0;
-      present_game(menuOpen ? (confirming ? &confirmMenu : hkPage ? &hkMenu : kbPage ? &kbMenu : &menu) : NULL);
+      slotThumbShow = menuOpen && slotPage && !confirming;
+      if (slotThumbShow && thumbFor != slotMenu.selected) {
+        char slotFile[PATH_MAX * 2 + 16];
+        slot_path(ss, slotMenu.selected < SLOTS ? slotMenu.selected + 1 : 0, slotFile, sizeof slotFile);
+        slot_thumb_load(slotFile);
+        thumbFor = slotMenu.selected;
+      }
+      present_game(menuOpen ? (confirming ? &confirmMenu : slotPage ? &slotMenu : hkPage ? &hkMenu : kbPage ? &kbMenu : &menu)
+                            : NULL);
       if (maxFrames && ++frames >= maxFrames) { // a scripted run can end, and be captured, with the menu up
         if (shot && !capture(shot))
           appError = 1;
@@ -2456,6 +2714,10 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
     if (++frames % 120 == 0)
       sram_write(sav, &sramCopy, true);
     present_game(NULL);
+    if (screenshotWanted) {
+      screenshotWanted = false;
+      screenshot_save(named);
+    }
     if (maxFrames && frames >= maxFrames) {
       if (shot && !capture(shot))
         appError = 1;
@@ -2475,6 +2737,12 @@ static void run_game_play(const char *path, int maxFrames, const char *shot, boo
     perf_frame(frameStart, hz);
   }
   sram_write(sav, &sramCopy, true);
+  if (hostSet.resume && frames > 60 && state_file(autoSS, true)) // where it was left, for next time (after the save)
+    thumb_write(autoSS);
+  if (slotThumb)
+    SDL_DestroyTexture(slotThumb);
+  slotThumb = NULL;
+  slotThumbShow = false;
   free(sramCopy.data);
   rewind_clear();
   core.unload_game();
@@ -2502,23 +2770,36 @@ static const char *base_name(const char *p) {
 /* ---- the library (library.c): the host's own SETTINGS rows, and its canvases and covers on the screen ---- */
 static bool libraryKeyboard; // the game list's KEYBOARD row was picked: its loop opens the page
 static bool libraryHotkeys;  // its HOTKEYS row: the controller's hotkeys page
+static bool librarySaves;    // its SAVES FOLDER row: the folders page
+enum { HR_LCD, HR_FF, HR_REWIND, HR_SAVES, HR_RESUME, HR_PAUSE, HR_AB, HR_KEYBOARD, HR_HOTKEYS, HR_CONTROLLER, HR_COUNT };
 static const char *lib_label(int row) {
-  static const char *const LABELS[] = {"LCD FILTER", "FF SPEED", "REWIND", "A/B BUTTONS", "KEYBOARD", "HOTKEYS", "CONTROLLER"};
+  static const char *const LABELS[HR_COUNT] = {"LCD FILTER",       "FF SPEED",    "REWIND",   "SAVES FOLDER",
+                                               "CONTINUE ON OPEN", "PAUSE IN BACKGROUND", "A/B BUTTONS", "KEYBOARD",
+                                               "HOTKEYS",          "CONTROLLER"};
   return LABELS[row];
 }
-static const char *lib_group(int row) { return row == 0 ? "SCREEN" : row < 3 ? "FF / SPEED" : "CONTROLS"; }
+static const char *lib_group(int row) {
+  return row == HR_LCD ? "SCREEN" : row <= HR_REWIND ? "FF / SPEED" : row <= HR_PAUSE ? "SAVES / PLAY" : "CONTROLS";
+}
+static void saves_folder_name(char *out, int len); // SAVES FOLDER's value (below, with its page)
 static void lib_value(int row, char *out, int len) {
-  if (row == 0)
+  if (row == HR_LCD)
     snprintf(out, (size_t)len, "%s", hostSet.lcd ? "ON" : "OFF");
-  else if (row == 1 && hostSet.ffSpeed)
+  else if (row == HR_FF && hostSet.ffSpeed)
     snprintf(out, (size_t)len, "%dx", hostSet.ffSpeed);
-  else if (row == 1)
+  else if (row == HR_FF)
     snprintf(out, (size_t)len, "MAX");
-  else if (row == 2)
+  else if (row == HR_REWIND)
     snprintf(out, (size_t)len, "%s", hostSet.rewind ? "ON" : "OFF");
-  else if (row == 3)
+  else if (row == HR_SAVES)
+    saves_folder_name(out, len);
+  else if (row == HR_RESUME)
+    snprintf(out, (size_t)len, "%s", hostSet.resume ? "ON" : "OFF");
+  else if (row == HR_PAUSE)
+    snprintf(out, (size_t)len, "%s", hostSet.pauseAway ? "ON" : "OFF");
+  else if (row == HR_AB)
     snprintf(out, (size_t)len, "%s", hostSet.swapAB ? "SWAPPED" : "NORMAL");
-  else if (row == 6) { // the controller in use, so a pad that isn't picked up shows here, not only in the log
+  else if (row == HR_CONTROLLER) { // the controller in use, so a pad that isn't picked up shows here, not only in the log
     const char *name = controller ? SDL_GameControllerName(controller) : NULL;
     if (name)
       snprintf(out, (size_t)len, "%s", name);
@@ -2532,21 +2813,26 @@ static void lib_value(int row, char *out, int len) {
     snprintf(out, (size_t)len, "EDIT");
 }
 static void lib_step(int row, int dir) {
-  if (row == 0)
+  if (row == HR_LCD)
     hostSet.lcd = !hostSet.lcd;
-  else if (row == 1) {
+  else if (row == HR_FF) {
     // MAX, 2x ... 8x, round.
     int v = hostSet.ffSpeed ? hostSet.ffSpeed - 1 : 0; // 0 MAX, 1..7 = 2x..8x
     v = (v + dir + 8) % 8;
     hostSet.ffSpeed = v ? v + 1 : 0;
-  } else if (row == 2)
+  } else if (row == HR_REWIND)
     hostSet.rewind = !hostSet.rewind;
-  else if (row == 3)
+  else if (row == HR_RESUME)
+    hostSet.resume = !hostSet.resume;
+  else if (row == HR_PAUSE)
+    hostSet.pauseAway = !hostSet.pauseAway;
+  else if (row == HR_AB)
     hostSet.swapAB = swapFace = !hostSet.swapAB;
-  else if (row == 6)
+  else if (row == HR_CONTROLLER)
     return; // shows the controller; nothing to change
   else {
-    *(row == 4 ? &libraryKeyboard : &libraryHotkeys) = true; // the loop opens the page over the list
+    // the loop opens the page over the list
+    *(row == HR_KEYBOARD ? &libraryKeyboard : row == HR_HOTKEYS ? &libraryHotkeys : &librarySaves) = true;
     return;
   }
   host_save();
@@ -2554,7 +2840,7 @@ static void lib_step(int row, int dir) {
 #ifndef POCKET_VERSION
 #define POCKET_VERSION "dev"
 #endif
-static const struct lib_host libraryHost = {7, lib_label, lib_group, lib_value, lib_step, POCKET_VERSION};
+static const struct lib_host libraryHost = {HR_COUNT, lib_label, lib_group, lib_value, lib_step, POCKET_VERSION};
 
 /* The game list's HOTKEYS page: the controller buttons for FAST FORWARD, REWIND, SAVE STATE and LOAD STATE, for the
  * Game Boy / GBA games and the DS games apart (as a game's own host menu sets them), and the MODIFIER held with them. */
@@ -2673,6 +2959,230 @@ static void gs_step(int i, int dir) {
   gsOwn[i] = order[(at + dir + n) % n];
   gs_write(gsGame, gsOwn);
   gs_build();
+}
+
+/* ---- SAVES FOLDER (SETTINGS): where the battery saves live. The app's own folder, a cloud drive's folder (iCloud
+ * Drive, Google Drive for desktop, a Syncthing folder) or one of the player's choosing. Moving copies what's there
+ * without overwriting anything (a cloud folder that already has saves keeps them: they're another computer's). ---- */
+enum { SV_APP, SV_ICLOUD, SV_GDRIVE, SV_SYNC, SV_CHOOSE, SV_SHOW, SV_ROWS };
+static char svRows[SV_ROWS][64];
+static const char *svPtrs[SV_ROWS];
+static struct pd_menu svMenu;
+static bool is_dir(const char *p) {
+  struct stat st;
+  return !stat(p, &st) && S_ISDIR(st.st_mode);
+}
+#ifndef _WIN32
+static int run_argv(const char *const *argv) {
+  pid_t pid;
+  if (posix_spawnp(&pid, argv[0], NULL, NULL, (char *const *)argv, environ))
+    return -1;
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+    ;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
+// The folder a row means (its "PokeDaisy Saves" folder in a cloud drive); false when that drive isn't on this computer.
+static bool saves_folder_for(int which, char *out, size_t size) {
+  const char *home = getenv("HOME");
+  char base[PATH_MAX];
+  base[0] = 0;
+  if (which == SV_APP) {
+    snprintf(out, size, "%s/saves", root);
+    return true;
+  }
+  if (!home)
+    return false;
+  if (which == SV_ICLOUD)
+    snprintf(base, sizeof base, "%s/Library/Mobile Documents/com~apple~CloudDocs", home);
+  else if (which == SV_SYNC)
+    snprintf(base, sizeof base, "%s/Sync", home);
+#ifndef _WIN32
+  else if (which == SV_GDRIVE) { // Google Drive for desktop: ~/Library/CloudStorage/GoogleDrive-<account>/My Drive
+    char pattern[PATH_MAX];
+    glob_t g;
+    snprintf(pattern, sizeof pattern, "%s/Library/CloudStorage/GoogleDrive-*/My Drive", home);
+    if (!glob(pattern, 0, NULL, &g) && g.gl_pathc)
+      snprintf(base, sizeof base, "%s", g.gl_pathv[0]);
+    globfree(&g);
+  }
+#endif
+  if (!base[0] || !is_dir(base))
+    return false;
+  snprintf(out, size, "%s/PokeDaisy Saves", base);
+  return true;
+}
+static void saves_folder_name(char *out, int len) {
+  static const char *const names[] = {"APP FOLDER", "ICLOUD DRIVE", "GOOGLE DRIVE", "SYNCTHING"};
+  char p[PATH_MAX];
+  for (int i = SV_APP; i <= SV_SYNC; i++)
+    if (saves_folder_for(i, p, sizeof p) && !strcmp(p, savesDir)) {
+      snprintf(out, (size_t)len, "%s", names[i]);
+      return;
+    }
+  const char *slash = strrchr(savesDir, '/');
+  snprintf(out, (size_t)len, "%s", slash && slash[1] ? slash + 1 : savesDir);
+  for (char *q = out; *q; q++)
+    *q = (char)toupper((unsigned char)*q);
+}
+static void sv_build(void) {
+  static const char *const names[] = {"APP FOLDER", "ICLOUD DRIVE", "GOOGLE DRIVE", "SYNCTHING FOLDER (~/Sync)"};
+  static const char *const missing[] = {"", "  (NOT SET UP)", "  (NOT INSTALLED)", "  (NOT FOUND)"};
+  char p[PATH_MAX];
+  for (int i = SV_APP; i <= SV_SYNC; i++) {
+    bool there = saves_folder_for(i, p, sizeof p);
+    snprintf(svRows[i], sizeof svRows[i], "%s%s", names[i],
+             !there ? missing[i] : !strcmp(p, savesDir) ? "  (IN USE)" : "");
+  }
+  snprintf(svRows[SV_CHOOSE], sizeof svRows[SV_CHOOSE], "CHOOSE A FOLDER...");
+#ifdef __APPLE__
+  snprintf(svRows[SV_SHOW], sizeof svRows[SV_SHOW], "SHOW SAVES IN FINDER");
+#else
+  snprintf(svRows[SV_SHOW], sizeof svRows[SV_SHOW], "SHOW SAVES FOLDER");
+#endif
+  for (int i = 0; i < SV_ROWS; i++)
+    svPtrs[i] = svRows[i];
+}
+static void sv_open(void) {
+  sv_build();
+  pd_menu_init(&svMenu, "SAVES FOLDER", svPtrs, SV_ROWS);
+  svMenu.overlay = true;
+}
+// The saves (and the cores' settings, the backups) copied into [to], nothing there overwritten; then it's the folder.
+static void saves_move(const char *to) {
+  if (!strcmp(to, savesDir)) {
+    library_say("Your saves are already in that folder");
+    return;
+  }
+#ifndef _WIN32
+  const char *mk[] = {"mkdir", "-p", to, NULL};
+  char from[PATH_MAX + 4], dest[PATH_MAX + 4];
+  snprintf(from, sizeof from, "%s/.", savesDir);
+  snprintf(dest, sizeof dest, "%s/", to);
+  const char *cp[] = {"cp", "-R", "-n", from, dest, NULL};
+  if (run_argv(mk) || !is_dir(to)) {
+    library_say("That folder couldn't be made");
+    return;
+  }
+  run_argv(cp); // cp -n says so (and fails) for each file it kept: that's what's wanted
+#endif
+  char app[PATH_MAX];
+  saves_folder_for(SV_APP, app, sizeof app);
+  snprintf(hostSet.savesFolder, sizeof hostSet.savesFolder, "%s", strcmp(to, app) ? to : "");
+  snprintf(savesDir, sizeof savesDir, "%s", to);
+  host_save();
+  library_reload(); // the list looks for each game's save in the new folder
+  char name[64], said[160];
+  saves_folder_name(name, sizeof name);
+  snprintf(said, sizeof said, "Saves now in %s (copied; any already there were kept)", name);
+  library_say(said);
+}
+// A row picked: true when the page is done.
+static bool sv_pick(int row) {
+  char p[PATH_MAX];
+  if (row <= SV_SYNC) {
+    if (!saves_folder_for(row, p, sizeof p)) {
+      library_say(row == SV_ICLOUD   ? "Turn on iCloud Drive in System Settings first"
+                  : row == SV_GDRIVE ? "Install Google Drive for desktop and sign in first"
+                                     : "Make a Sync folder in your home folder first (Syncthing's default)");
+      return false;
+    }
+    saves_move(p);
+    return true;
+  }
+#ifdef __APPLE__
+  if (row == SV_CHOOSE) {
+    FILE *f = popen("osascript -e 'POSIX path of (choose folder with prompt \"A folder for your PokeDaisy saves\")' "
+                    "2>/dev/null", "r");
+    char got[PATH_MAX] = "";
+    if (f) {
+      if (!fgets(got, sizeof got, f))
+        got[0] = 0;
+      pclose(f);
+    }
+    got[strcspn(got, "\r\n")] = 0;
+    size_t n = strlen(got);
+    if (n > 1 && got[n - 1] == '/')
+      got[n - 1] = 0;
+    if (got[0])
+      saves_move(got);
+    return got[0] != 0;
+  }
+  const char *show[] = {"open", savesDir, NULL};
+  run_argv(show);
+#elif !defined(_WIN32)
+  if (row == SV_CHOOSE) {
+    library_say("Pick a folder: put its path in host.ini as saves_dir=");
+    return false;
+  }
+  const char *show[] = {"xdg-open", savesDir, NULL};
+  run_argv(show);
+#endif
+  return true;
+}
+
+/* ---- RESTORE SAVE (a game's menu): the backups made of its save each time it's opened (newest first), one put back.
+ * The save it replaces is backed up first, so a restore can be undone the same way. ---- */
+#define RS_MAX 20
+static char rsRows[RS_MAX][48], rsFiles[RS_MAX][256], rsSav[PATH_MAX * 2], rsBackups[PATH_MAX * 2];
+static const char *rsPtrs[RS_MAX];
+static int rsCount, rsArmed = -1;
+static struct pd_menu rsMenu;
+static void rs_open(const char *game) {
+  pd_save_path(savesDir, game, rsSav, sizeof rsSav);
+  snprintf(rsBackups, sizeof rsBackups, "%s/pokedaisy-backups", savesDir);
+  const char *file = strrchr(rsSav, '/') ? strrchr(rsSav, '/') + 1 : rsSav, *dot = strrchr(file, '.');
+  char stem[300];
+  snprintf(stem, sizeof stem, "%.*s.backup-", dot && dot != file ? (int)(dot - file) : (int)strlen(file), file);
+  char *list[256];
+  int n = 0;
+  DIR *d = opendir(rsBackups);
+  for (struct dirent *e; d && (e = readdir(d)) && n < 256;)
+    if (!strncmp(e->d_name, stem, strlen(stem)) && !strstr(e->d_name, ".tmp"))
+      list[n++] = strdup(e->d_name);
+  if (d)
+    closedir(d);
+  qsort(list, n, sizeof *list, newest_first);
+  rsCount = 0;
+  for (int i = 0; i < n; i++) {
+    int y, mo, dd, h, mi;
+    if (rsCount < RS_MAX && sscanf(list[i] + strlen(stem), "%4d%2d%2d-%2d%2d", &y, &mo, &dd, &h, &mi) == 5) {
+      static const char *const months[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+      snprintf(rsRows[rsCount], sizeof rsRows[rsCount], "%s %d %d  %d:%02d %s", months[(mo + 11) % 12], dd, y,
+               h % 12 ? h % 12 : 12, mi, h < 12 ? "AM" : "PM");
+      snprintf(rsFiles[rsCount], sizeof rsFiles[rsCount], "%s", list[i]);
+      rsPtrs[rsCount] = rsRows[rsCount];
+      rsCount++;
+    }
+    free(list[i]);
+  }
+  if (!rsCount) {
+    snprintf(rsRows[0], sizeof rsRows[0], "NO BACKUPS YET");
+    rsPtrs[0] = rsRows[0];
+  }
+  rsArmed = -1;
+  pd_menu_init(&rsMenu, "RESTORE SAVE", rsPtrs, rsCount ? rsCount : 1);
+  rsMenu.overlay = true;
+}
+// The first A on a backup asks, the second puts it back: true when the page is done.
+static bool rs_pick(int row) {
+  if (row < 0 || row >= rsCount)
+    return !rsCount;
+  if (rsArmed != row) {
+    rsArmed = row;
+    rsMenu.title = "A AGAIN: RESTORE THIS ONE";
+    return false;
+  }
+  char from[PATH_MAX * 3];
+  snprintf(from, sizeof from, "%s/%s", rsBackups, rsFiles[row]);
+  size_t n;
+  unsigned char *d = read_file(from, &n, 64u << 20);
+  bool ok = d && save_backup(rsSav, rsBackups) && write_file(rsSav, d, n, true);
+  free(d);
+  library_say(ok ? "Save restored (the one it replaced is a backup now)" : "That backup couldn't be restored");
+  library_reload();
+  return true;
 }
 
 /* The library at a finer grain than the overlay (its 320x240 is the companion's): about 640x480 on a 1280x960 panel. Its
@@ -2888,6 +3398,11 @@ int main(int argc, char **argv) {
   snprintf(savesDir, sizeof savesDir, "%s/saves", root);
   snprintf(hostIni, sizeof hostIni, "%s/host.ini", root);
   host_load();
+  struct stat savesSt; // SAVES FOLDER: the one picked, while it's there (a cloud folder signed out of: the app's own)
+  if (hostSet.savesFolder[0] && !stat(hostSet.savesFolder, &savesSt) && S_ISDIR(savesSt.st_mode))
+    snprintf(savesDir, sizeof savesDir, "%s", hostSet.savesFolder);
+  else if (hostSet.savesFolder[0])
+    fprintf(stderr, "Saves folder %s isn't there: using %s\n", hostSet.savesFolder, savesDir);
   faceLabels = getenv("POCKET_FACE_LABELS") && !strcmp(getenv("POCKET_FACE_LABELS"), "1");
   comboMenu = !(getenv("POCKET_MENU_COMBO") && !strcmp(getenv("POCKET_MENU_COMBO"), "off"));
   // A window manager can give another window the focus over the game (plorpOS's in-game menu on the GKD): the
@@ -2932,6 +3447,14 @@ int main(int argc, char **argv) {
                             fullscreen ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_RESIZABLE);
 #ifdef _WIN32
   set_window_icon(window);
+#endif
+#ifdef __APPLE__
+  {
+    static const int menuCodes[] = {CMD_SETTINGS,  CMD_SEARCH,     CMD_BIGGER,     CMD_SMALLER,
+                                    CMD_ACTUAL,    CMD_FULLSCREEN, CMD_GAME_MENU,  CMD_SAVE_STATE,
+                                    CMD_LOAD_STATE, CMD_SCREENSHOT, CMD_GAMES_FOLDER, CMD_RELEASES};
+    mac_menu_install(menu_add_game, menuCodes);
+  }
 #endif
   // Presents wait for the refresh (the pacing, above); a driver without it gets the timer.
   renderer = window ? SDL_CreateRenderer(window, -1, getenv("POCKET_NO_VSYNC") ? 0 : SDL_RENDERER_PRESENTVSYNC) : NULL;
@@ -3008,6 +3531,7 @@ int main(int argc, char **argv) {
     int ticks = 0;
     bool keyPage = false; // the KEYBOARD page over the game list
     bool hkPage = false, gsPage = false; // HOTKEYS (SETTINGS), GAME SETTINGS (a game's menu)
+    bool svPage = false, rsPage = false; // SAVES FOLDER (SETTINGS), RESTORE SAVE (a game's menu)
     while (running && !library_quit() && !library_reload_wanted()) {
       listShown = true;
       events();
@@ -3023,7 +3547,7 @@ int main(int argc, char **argv) {
       // START + SELECT (dev's quit chord) asks to close as START or Menu do.
       if ((down(START) && (held >> SELECT & 1)) || (down(SELECT) && (held >> START & 1)))
         libDown = (libDown & ~(unsigned)LIB_SELECT) | LIB_START;
-      if (keyPage || hkPage || gsPage) // the page has the keys
+      if (keyPage || hkPage || gsPage || svPage || rsPage) // the page has the keys
         libDown = 0;
       library_keys(libDown);
       library_tick();
@@ -3035,18 +3559,22 @@ int main(int argc, char **argv) {
         pressed = held = 0; // the A that opened the page isn't the page's own
         libraryClick = false; // nor is the click that did
       }
-      if (libraryHotkeys || library_game_settings()) {
+      if (libraryHotkeys || librarySaves || library_game_settings()) {
         if (libraryHotkeys)
           hk_lib_open(), hkPage = true;
+        else if (librarySaves)
+          sv_open(), svPage = true;
+        else if (library_game_page() == LIB_PAGE_RESTORE)
+          rs_open(library_game_settings()), rsPage = true;
         else
           gs_open(library_game_settings()), gsPage = true;
-        libraryHotkeys = false;
+        libraryHotkeys = librarySaves = false;
         library_game_settings_done();
         pressed = held = 0;
         libraryClick = false;
       }
-      if (hkPage || gsPage) {
-        struct pd_menu *m = hkPage ? &hkLibMenu : &gsMenu;
+      if (hkPage || gsPage || svPage || rsPage) {
+        struct pd_menu *m = hkPage ? &hkLibMenu : gsPage ? &gsMenu : svPage ? &svMenu : &rsMenu;
         int px = 0, py = 0, row = -1;
         bool onPage = libraryClick && key_page_pointer(&px, &py);
         if (onPage) { // a click on a row: as A on it
@@ -3058,7 +3586,7 @@ int main(int argc, char **argv) {
           if (hkLibCapture >= 0 && libraryClick && !onPage)
             hkLibCapture = -1;
         } else if (down(B) || down(MENU) || (libraryClick && !onPage)) {
-          hkPage = gsPage = false; // B, Escape or a click beside the page closes it
+          hkPage = gsPage = svPage = rsPage = false; // B, Escape or a click beside the page closes it
         } else {
           if (down(UP))
             pd_menu_move(m, -1);
@@ -3073,6 +3601,18 @@ int main(int argc, char **argv) {
             gs_step(m->selected, 1);
           else if (gsPage && down(LEFT))
             gs_step(m->selected, -1);
+          else if (svPage && (down(A) || row >= 0)) {
+            if (sv_pick(m->selected))
+              svPage = false;
+            else
+              sv_build();
+          } else if (rsPage && (down(A) || row >= 0)) {
+            if (rs_pick(m->selected))
+              rsPage = false;
+          } else if (rsPage && (down(UP) || down(DOWN)) && rsArmed >= 0) {
+            rsArmed = -1; // moved off the backup asked about: ask again
+            rsMenu.title = "RESTORE SAVE";
+          }
         }
         if (hkPage)
           hk_lib_build();
@@ -3137,6 +3677,9 @@ int main(int argc, char **argv) {
           library_drop(libraryDropped);
           libraryDropped[0] = 0;
         }
+        for (int i = 0; i < addQueued; i++) // File > Add Games...
+          library_drop(addQueue[i]);
+        addQueued = 0;
         if ((libraryClick || libraryRightClick || libraryWheel) && mx >= 0 && my >= 0 && mx < w && my < h) {
           if (libraryRightClick)
             library_context(mx, my);
@@ -3159,7 +3702,7 @@ int main(int argc, char **argv) {
         libraryWheel = 0;
         library_played(picked);
       }
-      library_present(keyPage ? &kbMenu : hkPage ? &hkLibMenu : gsPage ? &gsMenu : NULL);
+      library_present(keyPage ? &kbMenu : hkPage ? &hkLibMenu : gsPage ? &gsMenu : svPage ? &svMenu : rsPage ? &rsMenu : NULL);
       if (frames && ++ticks >= frames) {
         if (shot && !capture(shot))
           appError = 1;

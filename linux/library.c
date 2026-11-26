@@ -912,6 +912,27 @@ static enum net lr_get(const char *url, char **body) {
   return code == 404 ? NET_NONE : NET_FAIL; // 403 / 429: GitHub's hourly limit, next start
 }
 
+#ifdef __APPLE__
+/* PokeDaisy for Mac's own releases (RedfernsOutpost/pokedaisy, tags mac-launcher-N): this build is N = PD_MAC_RELEASE.
+ * Looked up once a start, in the background; a newer one is said along the bottom and SETTINGS > VERSION opens it. */
+#define PD_MAC_RELEASE 2
+static const char *lr_json(const char *from, const char *key, char *out, size_t len);
+static int run_wait(const char *const *argv);
+static void say(const char *text);
+static SDL_atomic_t updateFound; // the newer release's N, 0 = none (yet)
+static bool updateSaid;
+static int update_check(void *unused) {
+  (void)unused;
+  char *body = NULL, tag[64];
+  int n = 0;
+  if (lr_get("https://api.github.com/repos/RedfernsOutpost/pokedaisy/releases/latest", &body) == NET_OK &&
+      lr_json(body, "tag_name", tag, sizeof tag) && sscanf(tag, "mac-launcher-%d", &n) == 1 && n > PD_MAC_RELEASE)
+    SDL_AtomicSet(&updateFound, n);
+  free(body);
+  return 0;
+}
+#endif
+
 /* GitHub's JSON is spaced ("key": "value"): the next [key]'s string value from [from] into out (\" and \\ unescaped);
  * returns where that value ends, NULL when there's no more. */
 static const char *lr_json(const char *from, const char *key, char *out, size_t len) {
@@ -1254,6 +1275,15 @@ static void check_saves(struct game *g) {
 }
 
 void library_open(char *const *paths, int count, const char *data, const char *saves, const struct lib_host *h) {
+#ifdef __APPLE__
+  static bool updateAsked;
+  if (!updateAsked && !getenv("POCKET_NO_UPDATE_CHECK")) { // once a start
+    updateAsked = true;
+    SDL_Thread *t = SDL_CreateThread(update_check, "update", NULL);
+    if (t)
+      SDL_DetachThread(t);
+  }
+#endif
   reloadWanted = searching = false;
   hoverGame = barGrab = -1;
   library_close();
@@ -1356,6 +1386,15 @@ void library_pause(bool paused) { SDL_AtomicSet(&pauseWorker, paused); }
 
 void library_tick(void) {
   clip_apply();
+#ifdef __APPLE__
+  if (SDL_AtomicGet(&updateFound) && !updateSaid) {
+    char said[96];
+    snprintf(said, sizeof said, "PokeDaisy for Mac %d is out: SETTINGS > VERSION to get it", SDL_AtomicGet(&updateFound));
+    say(said);
+    noticeUntil = SDL_GetTicks() + 6000;
+    updateSaid = true;
+  }
+#endif
   bool renamed = false;
   for (int i = 0; i < gameCount; i++) {
     struct game *g = &games[i];
@@ -1449,7 +1488,14 @@ static void setting_label(int row, char *label, int llen, char *value, int vlen)
       snprintf(value, (size_t)vlen, "NONE");
   } else {
     snprintf(label, (size_t)llen, "VERSION");
+#ifdef __APPLE__
+    if (SDL_AtomicGet(&updateFound))
+      snprintf(value, (size_t)vlen, "MAC %d: GET MAC %d", PD_MAC_RELEASE, SDL_AtomicGet(&updateFound));
+    else
+      snprintf(value, (size_t)vlen, "%s (MAC %d)", host && host->version ? host->version : "", PD_MAC_RELEASE);
+#else
     snprintf(value, (size_t)vlen, "%s", host && host->version ? host->version : "");
+#endif
   }
 }
 static void setting_step(int row, int dir) {
@@ -1477,6 +1523,13 @@ static void setting_step(int row, int dir) {
   else if (row == SET_OWN + host_rows()) {
     faceColors = !faceColors;
     state_save();
+  } else if (row == SET_OWN + host_rows() + 2) {
+#ifdef __APPLE__
+    if (SDL_AtomicGet(&updateFound)) { // the download page
+      const char *argv[] = {"open", "https://github.com/RedfernsOutpost/pokedaisy/releases/latest", NULL};
+      run_wait(argv);
+    }
+#endif
   } else if (row == SET_OWN + host_rows() + 1) {
     int shown = 0;
     for (int i = 0; i < gameCount; i++)
@@ -1510,7 +1563,7 @@ static void play(void) {
 /* ---- a cover of the player's choosing: FIND COVER ONLINE opens an image search for the game in the browser,
  * CHOOSE COVER takes an image file (any kind on a Mac, PNG elsewhere) as the game's box, DATA/covers/<file>.box.png. ---- */
 #define TOOLS 3     // SAVE EDITOR, TRADE SAVES, ADD GAMES
-#define MENU_ROWS 8 // PLAY, FAVORITE, GAME SETTINGS, FIND COVER ONLINE, CHOOSE COVER, SHOW IN FINDER, HIDE GAME, CANCEL
+#define MENU_ROWS 9 // PLAY, FAVORITE, GAME SETTINGS, RESTORE SAVE, FIND COVER ONLINE, CHOOSE COVER, SHOW IN FINDER, HIDE GAME, CANCEL
 #ifndef _WIN32
 static int run_wait(const char *const *argv) {
   pid_t pid;
@@ -1755,8 +1808,10 @@ static void clip_stop(void) {}
 static void clip_apply(void) {}
 #endif
 
-static char settingsFor[PATH_MAX]; // GAME SETTINGS was picked for this game: the host opens its page
+static char settingsFor[PATH_MAX]; // GAME SETTINGS / RESTORE SAVE was picked for this game: the host opens its page
+static int settingsPage;
 const char *library_game_settings(void) { return settingsFor[0] ? settingsFor : NULL; }
+int library_game_page(void) { return settingsPage; }
 void library_game_settings_done(void) { settingsFor[0] = 0; }
 
 static void menu_choose(void) {
@@ -1772,15 +1827,16 @@ static void menu_choose(void) {
     g->favSet = true;
     state_save();
     relist();
-  } else if (menuCursor == 2)
-    snprintf(settingsFor, sizeof settingsFor, "%s", g->path); // the host opens the game's page
-  else if (menuCursor == 3)
+  } else if (menuCursor == 2 || menuCursor == 3) { // the host opens the game's page
+    snprintf(settingsFor, sizeof settingsFor, "%s", g->path);
+    settingsPage = menuCursor == 2 ? LIB_PAGE_SETTINGS : LIB_PAGE_RESTORE;
+  } else if (menuCursor == 4)
     cover_search_online(g);
-  else if (menuCursor == 4)
-    cover_choose(g);
   else if (menuCursor == 5)
+    cover_choose(g);
+  else if (menuCursor == 6)
     show_in_folder(g->path);
-  else if (menuCursor == 6) {
+  else if (menuCursor == 7) {
     g->hidden = true;
     state_save();
     relist();
@@ -2547,8 +2603,8 @@ void library_draw_top(struct pd_canvas *c, uint32_t clear) {
 #else
     const char *finder = "SHOW IN FOLDER";
 #endif
-    const char *rows[MENU_ROWS] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "GAME SETTINGS", "FIND COVER ONLINE",
-                                   "CHOOSE COVER", finder, "HIDE GAME", "CANCEL"};
+    const char *rows[MENU_ROWS] = {"PLAY", g->fav ? "UNFAVORITE" : "FAVORITE", "GAME SETTINGS", "RESTORE SAVE",
+                                   "FIND COVER ONLINE", "CHOOSE COVER", finder, "HIDE GAME", "CANCEL"};
     int w = 240, h = 2 * 6 + 24 + MENU_ROWS * 24 + 4;
     int x = (c->w - w) / 2, y = (c->h - h) / 2;
     int f = window(c, x, y, w, h, g->title, rows, MENU_ROWS, menuCursor);
@@ -2632,6 +2688,7 @@ void library_zoom(int dir) {
 }
 
 bool library_reload_wanted(void) { return reloadWanted; }
+void library_reload(void) { reloadWanted = true; }
 
 /* A game file dropped on the window: copied into DATA/roms (it's listed after the host lists the games again). */
 static bool add_game(const char *path) {

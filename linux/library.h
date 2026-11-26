@@ -70,9 +70,14 @@ int library_covers(struct lib_cover *out, int max);
 void library_draw_top(struct pd_canvas *c, uint32_t clear);
 /* A menu or a question is up: the host darkens the covers too before library_draw_top. */
 bool library_dimmed(void);
-/* GAME SETTINGS was picked in a game's menu: that game's path until library_game_settings_done(), else NULL. */
+/* GAME SETTINGS or RESTORE SAVE was picked in a game's menu: that game's path until library_game_settings_done(), else
+ * NULL; library_game_page() says which. */
+enum { LIB_PAGE_SETTINGS = 1, LIB_PAGE_RESTORE };
 const char *library_game_settings(void);
+int library_game_page(void);
 void library_game_settings_done(void);
+/* The host changed where the saves are: the list is made again (as after games were added). */
+void library_reload(void);
 /* A game to play (then cleared), NULL = none. */
 const char *library_picked(void);
 /* The player closed the app. */
