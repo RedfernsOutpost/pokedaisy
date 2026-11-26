@@ -916,7 +916,7 @@ static enum net lr_get(const char *url, char **body) {
 }
 
 #ifdef __APPLE__
-#define PD_NO_GAMES "No Pokemon games found. File > Add Games, or drop one on the window."
+#define PD_NO_GAMES "No Pokemon games found. Add some with File > Add Games."
 #else
 #define PD_NO_GAMES "No Pokemon games found. Put them in roms/ beside PokeDaisy."
 #endif
